@@ -1,0 +1,178 @@
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
+
+use chrono::Utc;
+use tokio::{process::Command, time::timeout};
+
+use crate::{EvalError, PhaseTiming, Task, VerifierResult};
+
+pub(crate) struct AttemptPaths {
+    pub root: PathBuf,
+    pub workspace: PathBuf,
+    pub agent: PathBuf,
+    pub verifier: PathBuf,
+    pub events: PathBuf,
+    pub trajectory: PathBuf,
+    pub verifier_output: PathBuf,
+    pub reward: PathBuf,
+    pub result: PathBuf,
+}
+
+pub(crate) struct NativeAttempt {
+    pub paths: AttemptPaths,
+    pub setup_timing: PhaseTiming,
+}
+
+pub(crate) struct VerifierExecution {
+    pub result: VerifierResult,
+    pub timing: PhaseTiming,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl NativeAttempt {
+    pub fn prepare(output: &Path, trial_name: &str, task: &Task) -> Result<Self, EvalError> {
+        if task.requires_compose() {
+            return Err(EvalError::UnsupportedNativeTask {
+                task: task.name().to_owned(),
+                reason: "custom Docker Compose environments are not available in native mode",
+            });
+        }
+
+        let started_at = Utc::now();
+        let root = output.join(trial_name);
+        let workspace = root.join("workspace");
+        let agent = root.join("agent");
+        let verifier = root.join("verifier");
+        Self::create_directory(&workspace)?;
+        Self::create_directory(&agent)?;
+        Self::create_directory(&verifier)?;
+        Self::create_directory(&root.join("artifacts"))?;
+        Self::copy_directory_contents(&task.environment_directory(), &workspace)?;
+
+        Ok(Self {
+            paths: AttemptPaths {
+                events: agent.join("events.jsonl"),
+                trajectory: agent.join("trajectory.json"),
+                verifier_output: verifier.join("test-stdout.txt"),
+                reward: verifier.join("reward.txt"),
+                result: root.join("result.json"),
+                root,
+                workspace,
+                agent,
+                verifier,
+            },
+            setup_timing: PhaseTiming {
+                started_at,
+                finished_at: Utc::now(),
+            },
+        })
+    }
+
+    pub async fn verify(&self, task: &Task) -> Result<VerifierExecution, EvalError> {
+        let started_at = Utc::now();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg(task.verifier().script())
+            .current_dir(&self.paths.workspace)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", &self.paths.workspace)
+            .env("NANOEVAL_WORKSPACE", &self.paths.workspace)
+            .env("NANOEVAL_VERIFIER_LOGS", &self.paths.verifier)
+            .envs(task.environment().iter())
+            .envs(task.verifier().environment().iter())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = timeout(task.verifier().timeout(), command.output())
+            .await
+            .map_err(|_| EvalError::VerifierTimeout(task.verifier().timeout()))??;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let combined = match (stdout.is_empty(), stderr.is_empty()) {
+            (_, true) => stdout.clone(),
+            (true, false) => stderr.clone(),
+            (false, false) => format!("{stdout}\n{stderr}"),
+        };
+        fs::write(&self.paths.verifier_output, combined)?;
+
+        let reward_text = fs::read_to_string(&self.paths.reward)?;
+        let reward = reward_text.trim().parse::<f64>()?;
+        let mut rewards = BTreeMap::new();
+        rewards.insert("reward".to_owned(), reward);
+
+        Ok(VerifierExecution {
+            result: VerifierResult {
+                exit_code: output.status.code().unwrap_or(1),
+                rewards,
+            },
+            timing: PhaseTiming {
+                started_at,
+                finished_at: Utc::now(),
+            },
+            stdout,
+            stderr,
+        })
+    }
+
+    fn create_directory(path: &Path) -> Result<(), EvalError> {
+        fs::create_dir_all(path)?;
+        Ok(())
+    }
+
+    fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), EvalError> {
+        let entries = fs::read_dir(source)?;
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let target = destination.join(entry.file_name());
+            if file_type.is_dir() {
+                fs::create_dir_all(&target)?;
+                Self::copy_directory_contents(&entry.path(), &target)?;
+            } else if file_type.is_file() {
+                fs::copy(entry.path(), &target)?;
+            } else {
+                return Err(EvalError::UnsupportedEnvironmentEntry(entry.path()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::NativeAttempt;
+    use crate::Task;
+
+    #[tokio::test]
+    async fn prepares_and_verifies_an_independent_native_workspace() {
+        let task_directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting");
+        let task = Task::load(task_directory).unwrap();
+        let output = tempdir().unwrap();
+        let attempt = NativeAttempt::prepare(output.path(), "trial", &task).unwrap();
+
+        fs::write(
+            attempt.paths.workspace.join("greeting.txt"),
+            "hello from nanoeval\n",
+        )
+        .unwrap();
+        let execution = attempt.verify(&task).await.unwrap();
+
+        assert!((execution.result.rewards["reward"] - 1.0).abs() < f64::EPSILON);
+        assert_eq!(execution.result.exit_code, 0);
+        assert!(attempt.paths.verifier_output.is_file());
+        assert_eq!(fs::read_to_string(attempt.paths.reward).unwrap(), "1\n");
+    }
+}

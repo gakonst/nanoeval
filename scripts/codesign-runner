@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+binary=$1
+shift
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repository_dir=$(dirname -- "$script_dir")
+
+codesign \
+    --entitlements "$repository_dir/nanoeval.entitlements" \
+    --force \
+    --sign - \
+    "$binary"
+
+firmware_dir="$repository_dir/.cache/libkrunfw/v5.5.0/libkrunfw"
+if [ -f "$firmware_dir/libkrunfw.5.dylib" ]; then
+    if [ -n "${DYLD_LIBRARY_PATH:-}" ]; then
+        DYLD_LIBRARY_PATH="$firmware_dir:$DYLD_LIBRARY_PATH"
+    else
+        DYLD_LIBRARY_PATH=$firmware_dir
+    fi
+    export DYLD_LIBRARY_PATH
+fi
+
+exec "$binary" "$@"

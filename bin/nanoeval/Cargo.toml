@@ -1,0 +1,30 @@
+[package]
+name = "nanoeval-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "CLI consumer for Nanoeval and NanoVM"
+
+[dependencies]
+clap.workspace = true
+dotenvy.workspace = true
+eyre.workspace = true
+nanocodex.workspace = true
+nanoeval.workspace = true
+nanovm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "nanoeval"
+path = "src/main.rs"
+doc = false
+
+[lints]
+workspace = true

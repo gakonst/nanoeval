@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+if [ "$(uname -s)" = "Darwin" ]; then
+    PATH="$(brew --prefix lld)/bin:$PATH"
+    export PATH
+    exec /usr/bin/clang \
+        -target aarch64-linux-gnu \
+        -fuse-ld=lld \
+        -Wl,-strip-debug \
+        "$@"
+fi
+
+exec cc "$@"
