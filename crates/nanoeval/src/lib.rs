@@ -3,6 +3,7 @@ mod evaluator;
 mod event;
 mod job;
 mod native;
+mod plan;
 mod result;
 mod task;
 
@@ -15,6 +16,11 @@ pub use atif::{
 pub use evaluator::{EvalError, Nanoeval, NanoevalBuilder};
 pub use event::{
     EvalEvent, EvalEventKind, EvalEventStreamError, NanoevalEventStream, NanoevalEvents,
+};
+pub use plan::{
+    AgentVariant, AgentVariantId, AgentVariantSpec, EvalPlan, EvalPlanBuilder, EvalPlanError,
+    PlanIdError, PlannedAttempt, PlannedTask, ToolProfileId, TrialCount, TrialCountError,
+    TrialOrdinal,
 };
 pub use result::{
     AgentMetadata, AgentResult, AgentStatus, EvalArtifacts, EvalResult, EvalStatus, EvalTiming,

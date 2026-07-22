@@ -37,5 +37,13 @@ path = "src/bin/harbor_task.rs"
 name = "native-suite"
 path = "src/bin/native_suite.rs"
 
+[[bin]]
+name = "thinking-sweep"
+path = "src/bin/thinking_sweep.rs"
+
+[[bin]]
+name = "tool-sweep"
+path = "src/bin/tool_sweep.rs"
+
 [lints]
 workspace = true

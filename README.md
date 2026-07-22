@@ -139,6 +139,47 @@ The runnable core-only consumer is
 OPENAI_API_KEY=... cargo run -p nanoeval-examples --bin native-task
 ```
 
+### Finite sweeps
+
+`EvalPlan` describes the deterministic task × agent variant × trial product
+without hiding how agents are configured. Every variant carries a stable,
+filesystem-safe identity, a typed thinking level, a stable tool-profile
+identity, and the exact cloneable `NanocodexBuilder` used to create each fresh
+session:
+
+```rust,no_run
+# use nanocodex::{Nanocodex, Thinking};
+# use nanoeval::{AgentVariant, AgentVariantSpec, EvalPlan, Task, TrialCount};
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let task = Task::load("tasks/write-greeting")?;
+let auth = "api-key";
+let plan = EvalPlan::builder()
+    .task(task, TrialCount::new(5)?)
+    .variant(AgentVariant::new(
+        AgentVariantSpec::new("thinking-low", Thinking::Low, "defaults")?,
+        Nanocodex::builder(auth),
+    ))
+    .variant(AgentVariant::new(
+        AgentVariantSpec::new("thinking-high", Thinking::High, "defaults")?,
+        Nanocodex::builder(auth),
+    ))
+    .build()?;
+
+assert_eq!(plan.attempt_count(), 10);
+# Ok(())
+# }
+```
+
+The plan expands in task, variant, then one-based trial order. It does not
+share a Nanocodex conversation, workspace, tool runtime, or event sequence
+between entries. `EvalPlan` is a typed description in this first slice, not a
+combined executor or Harbor job; the examples run its variants concurrently
+with ordinary Tokio composition and retain a separate Nanoeval job for each
+variant. See the compiled
+[`thinking-sweep`](examples/src/bin/thinking_sweep.rs) and
+[`tool-sweep`](examples/src/bin/tool_sweep.rs) consumers for executable `k=5`
+thinking and default-tools-versus-MCP examples.
+
 ### Harbor adapter
 
 Harbor is a separate streaming adapter. Give it one subscription before
