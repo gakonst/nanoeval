@@ -16,6 +16,7 @@ dotenvy.workspace = true
 eyre.workspace = true
 nanocodex.workspace = true
 nanoeval.workspace = true
+nanoeval-harbor.workspace = true
 nanovm.workspace = true
 serde.workspace = true
 serde_json.workspace = true

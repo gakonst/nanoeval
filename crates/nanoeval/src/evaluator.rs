@@ -1,22 +1,20 @@
-use std::{
-    io::{BufWriter, Write},
-    num::ParseFloatError,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{num::ParseFloatError, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use nanocodex::{AgentEvent, AgentEventKind, NanocodexBuilder, NanocodexError, StandardResponses};
-use tokio::{sync::AcquireError, sync::Semaphore, time::timeout};
+use tokio::{
+    sync::{AcquireError, Semaphore, broadcast},
+    time::timeout,
+};
 use uuid::Uuid;
 
 use crate::{
-    AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalResult, EvalStatus,
-    EvalTiming, NanoevalEvents, PhaseTiming, Task, atif::AtifBuilder, harbor::HarborArtifacts,
-    native::NativeAttempt,
+    AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalResult, EvalRun,
+    EvalStatus, EvalTiming, NanoevalEvents, PhaseTiming, Task, native::NativeAttempt,
 };
+
+const EVENT_CAPACITY: usize = 16_384;
 
 /// A reusable evaluation recipe. Every task call creates an independent agent
 /// session and disposable workspace.
@@ -28,17 +26,16 @@ pub struct Nanoeval {
 /// Deliberate evaluator policy configured before running tasks.
 pub struct NanoevalBuilder {
     nanocodex: NanocodexBuilder<StandardResponses>,
-    output_directory: PathBuf,
+    run_directory: PathBuf,
     max_concurrency: usize,
 }
 
 struct NanoevalInner {
     nanocodex: NanocodexBuilder<StandardResponses>,
-    harbor: HarborArtifacts,
+    run: EvalRun,
     concurrency: Arc<Semaphore>,
     max_concurrency: usize,
-    events: tokio::sync::mpsc::UnboundedSender<EvalEvent>,
-    results: Mutex<Vec<EvalResult>>,
+    events: broadcast::Sender<Arc<EvalEvent>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,18 +51,6 @@ pub enum EvalError {
 
     #[error("unsupported non-file entry in task environment: {0}")]
     UnsupportedEnvironmentEntry(PathBuf),
-
-    #[error("trial directory cannot be represented as a file URL: {0}")]
-    InvalidTrialPath(PathBuf),
-
-    #[error("task directory is empty: {0}")]
-    EmptyTask(PathBuf),
-
-    #[error("task directory contains a cyclic symbolic link: {0}")]
-    CyclicTaskDirectory(PathBuf),
-
-    #[error("failed to compile task ignore rules: {0}")]
-    Ignore(#[from] ignore::Error),
 
     #[error("Nanocodex failed: {0}")]
     Nanocodex(#[from] NanocodexError),
@@ -94,7 +79,7 @@ impl Nanoeval {
     pub fn builder(nanocodex: NanocodexBuilder<StandardResponses>) -> NanoevalBuilder {
         NanoevalBuilder {
             nanocodex,
-            output_directory: PathBuf::from("nanoeval-runs"),
+            run_directory: PathBuf::from("nanoeval-runs"),
             max_concurrency: 1,
         }
     }
@@ -103,8 +88,7 @@ impl Nanoeval {
     ///
     /// # Errors
     ///
-    /// Returns an error when setup, the agent, verification, or artifact
-    /// publication fails.
+    /// Returns an error when setup, the agent, or verification fails.
     pub async fn task(&self, task: Task) -> Result<EvalResult, EvalError> {
         let _permit = Arc::clone(&self.inner.concurrency).acquire_owned().await?;
         self.run_task(task).await
@@ -116,7 +100,7 @@ impl Nanoeval {
     ///
     /// # Errors
     ///
-    /// Returns the first setup, agent, verifier, or publication error.
+    /// Returns the first setup, agent, or verifier error.
     pub async fn task_n(&self, task: Task, count: usize) -> Result<Vec<EvalResult>, EvalError> {
         self.tasks(std::iter::repeat_n(task, count)).await
     }
@@ -125,7 +109,7 @@ impl Nanoeval {
     ///
     /// # Errors
     ///
-    /// Returns the first setup, agent, verifier, or publication error.
+    /// Returns the first setup, agent, or verifier error.
     pub async fn tasks(
         &self,
         tasks: impl IntoIterator<Item = Task>,
@@ -146,35 +130,30 @@ impl Nanoeval {
     }
 
     #[must_use]
-    pub fn output_directory(&self) -> &Path {
-        self.inner.harbor.root()
+    pub fn run(&self) -> &EvalRun {
+        &self.inner.run
     }
 
     async fn run_task(&self, task: Task) -> Result<EvalResult, EvalError> {
         let started_at = Utc::now();
         let attempt_id = Uuid::new_v4();
-        let trial_name = HarborArtifacts::trial_name(&task, attempt_id);
-        let attempt = NativeAttempt::prepare(self.inner.harbor.root(), &trial_name, &task)?;
-        HarborArtifacts::write_input(&attempt, &task)?;
-        let agent = self.execute_agent(attempt_id, &task, &attempt).await?;
+        let trial_name = trial_name(&task, attempt_id);
+        let attempt = NativeAttempt::prepare(self.inner.run.directory(), &trial_name, &task)?;
+        let mut emitter = AttemptEmitter::new(self, attempt_id, &task, &trial_name);
+        emitter.emit(EvalEventKind::AttemptStarted {
+            prompt: task.prompt().to_owned(),
+            workspace: attempt.paths.workspace.clone(),
+        });
+        let agent = self.execute_agent(&mut emitter, &task, &attempt).await?;
 
-        self.emit(attempt_id, task.name(), EvalEventKind::VerifierStarted);
+        emitter.emit(EvalEventKind::VerifierStarted);
         let verifier = attempt.verify(&task).await?;
-        self.emit(
-            attempt_id,
-            task.name(),
-            EvalEventKind::VerifierOutput {
-                stdout: verifier.stdout.clone(),
-                stderr: verifier.stderr.clone(),
-            },
-        );
-        self.emit(
-            attempt_id,
-            task.name(),
-            EvalEventKind::VerifierCompleted(verifier.result.clone()),
-        );
+        emitter.emit(EvalEventKind::VerifierOutput {
+            stdout: verifier.stdout.clone(),
+            stderr: verifier.stderr.clone(),
+        });
+        emitter.emit(EvalEventKind::VerifierCompleted(verifier.result.clone()));
 
-        let trajectory = agent.atif.finish(&task, &agent.result);
         let result = EvalResult {
             attempt_id,
             task_name: task.name().to_owned(),
@@ -185,7 +164,6 @@ impl Nanoeval {
                 EvalStatus::Failed
             },
             agent: agent.result,
-            trajectory,
             verifier: verifier.result,
             timing: EvalTiming {
                 started_at,
@@ -198,33 +176,17 @@ impl Nanoeval {
             artifacts: EvalArtifacts {
                 directory: attempt.paths.root.clone(),
                 workspace: attempt.paths.workspace.clone(),
-                events_jsonl: attempt.paths.events.clone(),
-                trajectory_json: attempt.paths.trajectory.clone(),
                 verifier_output: attempt.paths.verifier_output.clone(),
-                result_json: attempt.paths.result.clone(),
             },
+            task,
         };
-        self.inner.harbor.write_trial(&attempt, &task, &result)?;
-        {
-            let mut results = self
-                .inner
-                .results
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            results.push(result.clone());
-            self.inner.harbor.write_job(&results)?;
-        }
-        self.emit(
-            attempt_id,
-            task.name(),
-            EvalEventKind::Completed(Box::new(result.clone())),
-        );
+        emitter.emit(EvalEventKind::Completed(Box::new(result.clone())));
         Ok(result)
     }
 
     async fn execute_agent(
         &self,
-        attempt_id: Uuid,
+        emitter: &mut AttemptEmitter<'_>,
         task: &Task,
         attempt: &NativeAttempt,
     ) -> Result<AgentExecution, EvalError> {
@@ -234,24 +196,17 @@ impl Nanoeval {
             .nanocodex
             .clone()
             .workspace(&attempt.paths.workspace)
-            .session_id(attempt_id.to_string())
+            .session_id(emitter.attempt_id.to_string())
             .build()?;
         let setup_timing = PhaseTiming::finished(setup_started);
         let execution_started = Utc::now();
         let turn = agent.prompt(task.prompt()).await?;
         let control = turn.control();
-        let mut atif = AtifBuilder::default();
         let event_result = timeout(task.agent_timeout(), async {
-            let file = std::fs::File::create(&attempt.paths.events)?;
-            let mut writer = BufWriter::new(file);
             loop {
                 let event = events.recv().await.ok_or(EvalError::AgentEventsClosed)?;
-                serde_json::to_writer(&mut writer, &event)?;
-                writer.write_all(b"\n")?;
-                writer.flush()?;
                 let terminal = event.kind.is_terminal();
-                atif.apply(&event)?;
-                self.emit(attempt_id, task.name(), EvalEventKind::Agent(event.clone()));
+                emitter.emit(EvalEventKind::Agent(event.clone()));
                 if terminal {
                     let result = turn.result().await?;
                     return Ok::<_, EvalError>((result, event));
@@ -268,32 +223,24 @@ impl Nanoeval {
         drop(agent);
         Ok(AgentExecution {
             result: AgentResult::from_terminal(turn_result.final_message, &terminal_event)?,
-            atif,
             setup_timing,
             execution_timing: PhaseTiming::finished(execution_started),
         })
-    }
-
-    fn emit(&self, attempt_id: Uuid, task_name: &str, kind: EvalEventKind) {
-        let _ = self.inner.events.send(EvalEvent {
-            attempt_id,
-            task_name: task_name.to_owned(),
-            kind,
-        });
     }
 }
 
 struct AgentExecution {
     result: AgentResult,
-    atif: AtifBuilder,
     setup_timing: PhaseTiming,
     execution_timing: PhaseTiming,
 }
 
 impl NanoevalBuilder {
+    /// Sets the parent under which this evaluator creates one UUID-named
+    /// native run directory.
     #[must_use]
-    pub fn output_directory(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.output_directory = directory.into();
+    pub fn run_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.run_directory = directory.into();
         self
     }
 
@@ -303,7 +250,7 @@ impl NanoevalBuilder {
         self
     }
 
-    /// Builds a reusable evaluator and its optional multiplexed event stream.
+    /// Builds a reusable evaluator and a source of independent event streams.
     ///
     /// # Errors
     ///
@@ -312,22 +259,59 @@ impl NanoevalBuilder {
         if self.max_concurrency == 0 {
             return Err(EvalError::InvalidConcurrency);
         }
-        let harbor = HarborArtifacts::create(&self.output_directory, self.max_concurrency)?;
-        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let run = EvalRun::create(&self.run_directory, self.max_concurrency)?;
+        let (event_sender, _) = broadcast::channel(EVENT_CAPACITY);
         Ok((
             Nanoeval {
                 inner: Arc::new(NanoevalInner {
                     nanocodex: self.nanocodex,
-                    harbor,
+                    run,
                     concurrency: Arc::new(Semaphore::new(self.max_concurrency)),
                     max_concurrency: self.max_concurrency,
-                    events: event_sender,
-                    results: Mutex::new(Vec::new()),
+                    events: event_sender.clone(),
                 }),
             },
-            NanoevalEvents::new(event_receiver),
+            NanoevalEvents::new(event_sender),
         ))
     }
+}
+
+struct AttemptEmitter<'a> {
+    eval: &'a Nanoeval,
+    attempt_id: Uuid,
+    task_name: String,
+    trial_name: String,
+    sequence: u64,
+}
+
+impl<'a> AttemptEmitter<'a> {
+    fn new(eval: &'a Nanoeval, attempt_id: Uuid, task: &Task, trial_name: &str) -> Self {
+        Self {
+            eval,
+            attempt_id,
+            task_name: task.name().to_owned(),
+            trial_name: trial_name.to_owned(),
+            sequence: 0,
+        }
+    }
+
+    fn emit(&mut self, kind: EvalEventKind) {
+        self.sequence += 1;
+        let _ = self.eval.inner.events.send(Arc::new(EvalEvent {
+            run_id: self.eval.inner.run.id(),
+            attempt_id: self.attempt_id,
+            task_name: self.task_name.clone(),
+            trial_name: self.trial_name.clone(),
+            sequence: self.sequence,
+            kind,
+        }));
+    }
+}
+
+fn trial_name(task: &Task, attempt_id: Uuid) -> String {
+    let short_name = task.name().rsplit('/').next().unwrap_or(task.name());
+    let compact_id = attempt_id.simple().to_string();
+    format!("{short_name}__{}", &compact_id[..8])
 }
 
 impl AgentResult {

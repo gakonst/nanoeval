@@ -1847,16 +1847,13 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "futures-util",
- "ignore",
  "nanocodex",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "toml",
- "url",
  "uuid",
 ]
 
@@ -1869,6 +1866,7 @@ dependencies = [
  "eyre",
  "nanocodex",
  "nanoeval",
+ "nanoeval-harbor",
  "nanovm",
  "serde",
  "serde_json",
@@ -1881,8 +1879,26 @@ version = "0.1.0"
 dependencies = [
  "nanocodex",
  "nanoeval",
+ "nanoeval-harbor",
  "nanovm",
  "tokio",
+]
+
+[[package]]
+name = "nanoeval-harbor"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ignore",
+ "nanoeval",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]

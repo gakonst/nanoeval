@@ -13,13 +13,9 @@ use crate::{EvalError, PhaseTiming, Task, VerifierResult};
 pub(crate) struct AttemptPaths {
     pub root: PathBuf,
     pub workspace: PathBuf,
-    pub agent: PathBuf,
     pub verifier: PathBuf,
-    pub events: PathBuf,
-    pub trajectory: PathBuf,
     pub verifier_output: PathBuf,
     pub reward: PathBuf,
-    pub result: PathBuf,
 }
 
 pub(crate) struct NativeAttempt {
@@ -46,24 +42,17 @@ impl NativeAttempt {
         let started_at = Utc::now();
         let root = output.join(trial_name);
         let workspace = root.join("workspace");
-        let agent = root.join("agent");
         let verifier = root.join("verifier");
         Self::create_directory(&workspace)?;
-        Self::create_directory(&agent)?;
         Self::create_directory(&verifier)?;
-        Self::create_directory(&root.join("artifacts"))?;
         Self::copy_directory_contents(&task.environment_directory(), &workspace)?;
 
         Ok(Self {
             paths: AttemptPaths {
-                events: agent.join("events.jsonl"),
-                trajectory: agent.join("trajectory.json"),
                 verifier_output: verifier.join("test-stdout.txt"),
                 reward: verifier.join("reward.txt"),
-                result: root.join("result.json"),
                 root,
                 workspace,
-                agent,
                 verifier,
             },
             setup_timing: PhaseTiming {

@@ -2,8 +2,10 @@
 
 Status: the first native vertical slice is complete. A reusable `Nanoeval`
 accepts a `NanocodexBuilder`, creates a fresh session and workspace per task,
-runs a canonical verifier, multiplexes typed events, and retains
-Harbor-compatible job/trial/ATIF output. The simple `write-greeting` fixture has
+runs a canonical verifier, and fans sequenced typed events out to independent
+loss-aware subscriptions. The separate `nanoeval-harbor` adapter records one
+subscription into Harbor-compatible job/trial/ATIF output while application
+consumers receive the same stream independently. The simple `write-greeting` fixture has
 passed live; its configs, locks, results, and ATIF validate with Harbor's own
 models, and `harbor view` reads the job, trial, trajectory, verifier, and file
 endpoints directly. ATIF is now a typed field on `EvalResult` and is folded
@@ -22,7 +24,8 @@ The repository follows the same library-first layout as Nanocodex:
   libkrun/KVM/HVF lifecycle, the future VMM process protocol, execution, and
   pause/resume;
 - `nanoeval` owns evaluation: task loading, preparation, attempts, verification,
-  persistence, and scheduling;
+  native run state, typed event subscriptions, and scheduling;
+- `nanoeval-harbor` owns the explicit streaming Harbor and ATIF projection;
 - `bin/nanoeval` is a thin CLI over those libraries; and
 - `examples` compiles the intended public consumption paths.
 

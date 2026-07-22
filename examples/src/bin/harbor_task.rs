@@ -2,6 +2,7 @@ use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAiAuth};
 use nanoeval::{EvalEventKind, Nanoeval, Task};
+use nanoeval_harbor::Harbor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -10,11 +11,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_or_else(|| PathBuf::from("tasks/write-greeting"), PathBuf::from);
     let output_directory = env::args_os()
         .nth(2)
-        .map_or_else(|| PathBuf::from("nanoeval-native-runs"), PathBuf::from);
+        .map_or_else(|| PathBuf::from("nanoeval-runs"), PathBuf::from);
     let task = Task::load(task_directory)?;
     let (eval, events) = Nanoeval::builder(Nanocodex::builder(auth()?))
         .run_directory(output_directory)
         .build()?;
+
+    let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
     let mut event_stream = events.subscribe();
     let observer_task = tokio::spawn(async move {
         let mut count = 0_u64;
@@ -26,11 +29,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Ok::<_, nanoeval::EvalEventStreamError>(count)
     });
+
     let result = eval.task(task).await?;
+    let job = harbor.finish(vec![result.clone()]).await?;
     let event_count = observer_task.await??;
+
     println!("{}: {:?}", result.trial_name, result.status);
-    println!("Observed {event_count} typed events");
-    println!("Native run: {}", eval.run().directory().display());
+    println!("Observed {event_count} typed events independently");
+    println!("Harbor job: {}", job.directory().display());
     Ok(())
 }
 

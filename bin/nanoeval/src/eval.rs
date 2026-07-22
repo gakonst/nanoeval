@@ -1,8 +1,9 @@
 use std::{io, path::PathBuf};
 
 use clap::Args;
-use eyre::Result;
-use nanoeval::{EvalResult, Nanoeval, Task};
+use eyre::{Result, eyre};
+use nanoeval::{EvalEventKind, EvalResult, Nanoeval, NanoevalEventStream, Task};
+use nanoeval_harbor::{Harbor, HarborJob};
 
 use crate::config::AgentArgs;
 
@@ -40,30 +41,58 @@ impl Eval {
             .into_iter()
             .map(Task::load)
             .collect::<Result<Vec<_>, _>>()?;
+        let attempt_count = tasks.len() * trials;
         let attempts = tasks
             .into_iter()
             .flat_map(|task| std::iter::repeat_n(task, trials));
         let (eval, events) = Nanoeval::builder(self.agent.builder()?)
-            .output_directory(self.output)
+            .run_directory(self.output)
             .max_concurrency(usize::from(self.concurrency))
             .build()?;
-        drop(events);
+        let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
+        let progress = tokio::spawn(report_progress(events.subscribe(), attempt_count));
         let results = eval.tasks(attempts).await?;
+        let job = harbor.finish(results.clone()).await?;
+        progress.await??;
         if self.json {
             serde_json::to_writer_pretty(io::stdout().lock(), &results)?;
             println!();
         } else {
-            Self::write_summary(&eval, &results);
+            Self::write_summary(&job, &results);
         }
         Ok(())
     }
 
-    fn write_summary(eval: &Nanoeval, results: &[EvalResult]) {
+    fn write_summary(job: &HarborJob, results: &[EvalResult]) {
         for result in results {
             println!("{}: {:?}", result.trial_name, result.status);
         }
-        println!("Harbor job: {}", eval.output_directory().display());
+        println!("Harbor job: {}", job.directory().display());
     }
+}
+
+async fn report_progress(mut events: NanoevalEventStream, expected: usize) -> Result<()> {
+    let mut completed = 0;
+    while completed < expected {
+        let event = events
+            .recv()
+            .await?
+            .ok_or_else(|| eyre!("event stream closed after {completed} of {expected} attempts"))?;
+        match &event.kind {
+            EvalEventKind::AttemptStarted { .. } => {
+                eprintln!("{}: started", event.trial_name);
+            }
+            EvalEventKind::Completed(result) => {
+                completed += 1;
+                eprintln!("{}: {:?}", event.trial_name, result.status);
+            }
+            EvalEventKind::Agent(_)
+            | EvalEventKind::VerifierStarted
+            | EvalEventKind::VerifierOutput { .. }
+            | EvalEventKind::VerifierCompleted(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

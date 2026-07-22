@@ -180,8 +180,9 @@ pub struct AtifRuntimeMetrics {
     pub reasoning_output_tokens: u64,
 }
 
+/// Explicit streaming projection from typed Nanocodex events into ATIF.
 #[derive(Default)]
-pub(crate) struct AtifBuilder {
+pub struct AtifBuilder {
     session_id: Option<String>,
     turns: BTreeMap<u32, AtifTurn>,
     tool_turns: BTreeMap<String, u32>,
@@ -199,7 +200,12 @@ struct AtifTurn {
 }
 
 impl AtifBuilder {
-    pub(crate) fn apply(&mut self, event: &AgentEvent) -> Result<(), serde_json::Error> {
+    /// Applies one typed event in its original sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a known event's typed payload is malformed.
+    pub fn apply(&mut self, event: &AgentEvent) -> Result<(), serde_json::Error> {
         if self.session_id.is_none() {
             self.session_id = Some(event.request_id.to_string());
         }
@@ -280,7 +286,8 @@ impl AtifBuilder {
         Ok(())
     }
 
-    pub(crate) fn finish(self, task: &Task, result: &AgentResult) -> AtifTrajectory {
+    #[must_use]
+    pub fn finish(self, task: &Task, result: &AgentResult) -> AtifTrajectory {
         let runtime = AtifRuntimeMetrics::from(&result.metadata);
         let mut steps = Vec::with_capacity(self.turns.len() + 1);
         steps.push(AtifStep::user(1, task.prompt()));

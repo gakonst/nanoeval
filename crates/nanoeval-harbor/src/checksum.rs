@@ -7,21 +7,21 @@ use std::{
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sha2::{Digest, Sha256};
 
-use crate::EvalError;
+use crate::HarborError;
 
 const PACKAGE_FILES: [&str; 3] = ["task.toml", "instruction.md", "README.md"];
 const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "steps"];
 
 /// Matches `dirhash(directory, "sha256")`, which Harbor currently records as
 /// `TrialResult.task_checksum`.
-pub(crate) fn directory_hash(root: &Path) -> Result<String, EvalError> {
+pub(crate) fn directory_hash(root: &Path) -> Result<String, HarborError> {
     let mut ancestors = HashSet::new();
-    hash_directory(root, &mut ancestors)?.ok_or_else(|| EvalError::EmptyTask(root.to_path_buf()))
+    hash_directory(root, &mut ancestors)?.ok_or_else(|| HarborError::EmptyTask(root.to_path_buf()))
 }
 
 /// Matches Harbor's `Packager.compute_content_hash`, which is recorded with a
 /// `sha256:` prefix in job and trial locks.
-pub(crate) fn package_content_hash(root: &Path) -> Result<String, EvalError> {
+pub(crate) fn package_content_hash(root: &Path) -> Result<String, HarborError> {
     let matcher = package_ignore_matcher(root)?;
     let mut files = Vec::new();
     for name in PACKAGE_FILES {
@@ -53,10 +53,10 @@ pub(crate) fn package_content_hash(root: &Path) -> Result<String, EvalError> {
 fn hash_directory(
     directory: &Path,
     ancestors: &mut HashSet<PathBuf>,
-) -> Result<Option<String>, EvalError> {
+) -> Result<Option<String>, HarborError> {
     let canonical = fs::canonicalize(directory)?;
     if !ancestors.insert(canonical) {
-        return Err(EvalError::CyclicTaskDirectory(directory.to_path_buf()));
+        return Err(HarborError::CyclicTaskDirectory(directory.to_path_buf()));
     }
 
     let result = (|| {
@@ -91,7 +91,7 @@ fn collect_package_files(
     directory: &Path,
     matcher: Option<&Gitignore>,
     files: &mut Vec<PathBuf>,
-) -> Result<(), EvalError> {
+) -> Result<(), HarborError> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -108,7 +108,7 @@ fn collect_package_files(
     Ok(())
 }
 
-fn package_ignore_matcher(root: &Path) -> Result<Option<Gitignore>, EvalError> {
+fn package_ignore_matcher(root: &Path) -> Result<Option<Gitignore>, HarborError> {
     let path = root.join(".gitignore");
     if !path.is_file() {
         return Ok(None);

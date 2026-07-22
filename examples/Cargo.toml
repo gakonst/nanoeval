@@ -13,6 +13,7 @@ description = "Public Nanoeval and NanoVM library examples"
 [dependencies]
 nanocodex.workspace = true
 nanoeval.workspace = true
+nanoeval-harbor.workspace = true
 nanovm.workspace = true
 tokio.workspace = true
 
@@ -27,6 +28,10 @@ path = "src/bin/run_vm.rs"
 [[bin]]
 name = "native-task"
 path = "src/bin/native_task.rs"
+
+[[bin]]
+name = "harbor-task"
+path = "src/bin/harbor_task.rs"
 
 [[bin]]
 name = "native-suite"

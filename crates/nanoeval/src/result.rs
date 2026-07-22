@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::AtifTrajectory;
+use crate::Task;
 
 /// Terminal score classification for one attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -22,10 +22,19 @@ pub struct EvalResult {
     pub trial_name: String,
     pub status: EvalStatus,
     pub agent: AgentResult,
-    pub trajectory: AtifTrajectory,
     pub verifier: VerifierResult,
     pub timing: EvalTiming,
     pub artifacts: EvalArtifacts,
+    #[serde(skip)]
+    pub(crate) task: Task,
+}
+
+impl EvalResult {
+    /// The immutable task definition used by this attempt.
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        &self.task
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -116,8 +125,5 @@ pub struct PhaseTiming {
 pub struct EvalArtifacts {
     pub directory: PathBuf,
     pub workspace: PathBuf,
-    pub events_jsonl: PathBuf,
-    pub trajectory_json: PathBuf,
     pub verifier_output: PathBuf,
-    pub result_json: PathBuf,
 }

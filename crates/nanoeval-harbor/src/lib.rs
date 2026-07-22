@@ -1,24 +1,237 @@
+mod checksum;
+
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
-    fs,
+    fs::{self, File},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
 use chrono::{DateTime, Utc};
+use nanoeval::{
+    AgentMetadata, AtifBuilder, AtifTrajectory, EvalEventKind, EvalEventStreamError, EvalResult,
+    EvalRun, NanoevalEventStream, PhaseTiming, Task,
+};
 use serde::Serialize;
+use tokio::{sync::oneshot, task::JoinHandle};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{
-    AgentMetadata, EvalError, EvalResult, PhaseTiming, Task,
-    harbor_checksum::{directory_hash, package_content_hash},
-    native::NativeAttempt,
-};
+use checksum::{directory_hash, package_content_hash};
 
-/// Owns one Harbor-shaped retained job directory.
-pub(crate) struct HarborArtifacts {
+#[derive(Debug, thiserror::Error)]
+pub enum HarborError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    #[error("failed to compile task ignore rules: {0}")]
+    Ignore(#[from] ignore::Error),
+
+    #[error("task directory is empty: {0}")]
+    EmptyTask(PathBuf),
+
+    #[error("task directory contains a cyclic symbolic link: {0}")]
+    CyclicTaskDirectory(PathBuf),
+
+    #[error("trial directory cannot be represented as a file URL: {0}")]
+    InvalidTrialPath(PathBuf),
+
+    #[error(transparent)]
+    EventStream(#[from] EvalEventStreamError),
+
+    #[error("received events for attempt {0} before attempt.started")]
+    MissingAttempt(Uuid),
+
+    #[error("received duplicate attempt.started for attempt {0}")]
+    DuplicateAttempt(Uuid),
+
+    #[error("Harbor recorder stopped before finish")]
+    RecorderStopped,
+
+    #[error("Nanoeval event stream closed before Harbor recording finished")]
+    EventStreamClosed,
+
+    #[error("Harbor recorder task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    #[error("Harbor recording requires an active Tokio runtime: {0}")]
+    Runtime(#[from] tokio::runtime::TryCurrentError),
+}
+
+/// Explicit Harbor compatibility adapter for one Nanoeval run.
+pub struct Harbor {
+    artifacts: HarborArtifacts,
+}
+
+/// Active, streaming Harbor projection of an independent event subscription.
+pub struct HarborRecorder {
+    finish: Option<oneshot::Sender<Vec<EvalResult>>>,
+    task: Option<JoinHandle<Result<HarborJob, HarborError>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HarborJob {
+    id: Uuid,
+    directory: PathBuf,
+}
+
+impl Harbor {
+    /// Attaches the adapter to an existing native Nanoeval run directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run directory cannot be initialized with
+    /// Harbor job metadata.
+    pub fn new(run: &EvalRun) -> Result<Self, HarborError> {
+        Ok(Self {
+            artifacts: HarborArtifacts::attach(run)?,
+        })
+    }
+
+    /// Starts consuming one independent event subscription immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called without an active Tokio runtime.
+    pub fn record(self, events: NanoevalEventStream) -> Result<HarborRecorder, HarborError> {
+        let (finish, finish_receiver) = oneshot::channel();
+        let task = tokio::runtime::Handle::try_current()?.spawn(record(
+            self.artifacts,
+            events,
+            finish_receiver,
+        ));
+        Ok(HarborRecorder {
+            finish: Some(finish),
+            task: Some(task),
+        })
+    }
+}
+
+impl HarborRecorder {
+    /// Waits until every supplied result's terminal event has been recorded,
+    /// then commits the final Harbor job result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on event lag, malformed event payloads, filesystem
+    /// failures, or premature recorder termination.
+    pub async fn finish(mut self, results: Vec<EvalResult>) -> Result<HarborJob, HarborError> {
+        self.finish
+            .take()
+            .ok_or(HarborError::RecorderStopped)?
+            .send(results)
+            .map_err(|_| HarborError::RecorderStopped)?;
+        self.task
+            .take()
+            .ok_or(HarborError::RecorderStopped)?
+            .await?
+    }
+}
+
+impl Drop for HarborRecorder {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl HarborJob {
+    #[must_use]
+    pub const fn id(&self) -> Uuid {
+        self.id
+    }
+
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
+struct AttemptRecording {
+    events: BufWriter<File>,
+    atif: AtifBuilder,
+}
+
+async fn record(
+    artifacts: HarborArtifacts,
+    mut events: NanoevalEventStream,
+    mut finish: oneshot::Receiver<Vec<EvalResult>>,
+) -> Result<HarborJob, HarborError> {
+    let mut attempts = HashMap::<Uuid, AttemptRecording>::new();
+    let mut completed = HashSet::<Uuid>::new();
+    let mut recorded_results = Vec::<EvalResult>::new();
+    let mut final_results = None::<Vec<EvalResult>>;
+
+    loop {
+        if let Some(results) = final_results.as_ref()
+            && results
+                .iter()
+                .all(|result| completed.contains(&result.attempt_id))
+        {
+            artifacts.write_job(results)?;
+            return Ok(HarborJob {
+                id: artifacts.job_id,
+                directory: artifacts.root.clone(),
+            });
+        }
+
+        tokio::select! {
+            requested = &mut finish, if final_results.is_none() => {
+                final_results = Some(requested.map_err(|_| HarborError::RecorderStopped)?);
+            }
+            event = events.recv() => {
+                let event = event?.ok_or(HarborError::EventStreamClosed)?;
+                match &event.kind {
+                    EvalEventKind::AttemptStarted { prompt, .. } => {
+                        let writer = artifacts.write_input(
+                            event.attempt_id,
+                            &event.trial_name,
+                            prompt,
+                        )?;
+                        if attempts.insert(event.attempt_id, AttemptRecording {
+                            events: writer,
+                            atif: AtifBuilder::default(),
+                        }).is_some() {
+                            return Err(HarborError::DuplicateAttempt(event.attempt_id));
+                        }
+                    }
+                    EvalEventKind::Agent(agent_event) => {
+                        let attempt = attempts
+                            .get_mut(&event.attempt_id)
+                            .ok_or(HarborError::MissingAttempt(event.attempt_id))?;
+                        serde_json::to_writer(&mut attempt.events, agent_event)?;
+                        attempt.events.write_all(b"\n")?;
+                        attempt.events.flush()?;
+                        attempt.atif.apply(agent_event)?;
+                    }
+                    EvalEventKind::Completed(result) => {
+                        let mut attempt = attempts
+                            .remove(&event.attempt_id)
+                            .ok_or(HarborError::MissingAttempt(event.attempt_id))?;
+                        attempt.events.flush()?;
+                        let result = result.as_ref().clone();
+                        let trajectory = attempt.atif.finish(result.task(), &result.agent);
+                        artifacts.write_trial(&result, &trajectory)?;
+                        completed.insert(result.attempt_id);
+                        recorded_results.push(result);
+                        artifacts.write_job(&recorded_results)?;
+                    }
+                    EvalEventKind::VerifierStarted
+                    | EvalEventKind::VerifierOutput { .. }
+                    | EvalEventKind::VerifierCompleted(_) => {}
+                }
+            }
+        }
+    }
+}
+
+struct HarborArtifacts {
     job_id: Uuid,
     started_at: DateTime<Utc>,
     root: PathBuf,
@@ -28,18 +241,13 @@ pub(crate) struct HarborArtifacts {
 }
 
 impl HarborArtifacts {
-    pub fn create(output_directory: &Path, max_concurrency: usize) -> Result<Self, EvalError> {
-        let job_id = Uuid::new_v4();
-        fs::create_dir_all(output_directory)?;
-        let output_directory = fs::canonicalize(output_directory)?;
-        let root = output_directory.join(job_id.to_string());
-        fs::create_dir_all(&root)?;
+    fn attach(run: &EvalRun) -> Result<Self, HarborError> {
         let artifacts = Self {
-            job_id,
-            started_at: Utc::now(),
-            root,
-            jobs_dir: output_directory,
-            max_concurrency,
+            job_id: run.id(),
+            started_at: run.started_at(),
+            root: run.directory().to_path_buf(),
+            jobs_dir: run.parent_directory().to_path_buf(),
+            max_concurrency: run.max_concurrency(),
             recorded_trials: Mutex::new(Vec::new()),
         };
         Self::write_file(&artifacts.root.join("job.log"), [])?;
@@ -48,40 +256,37 @@ impl HarborArtifacts {
         Ok(artifacts)
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn trial_name(task: &Task, attempt_id: Uuid) -> String {
-        let short_name = task.name().rsplit('/').next().unwrap_or(task.name());
-        let compact_id = attempt_id.simple().to_string();
-        format!("{short_name}__{}", &compact_id[..8])
-    }
-
-    pub fn write_input(attempt: &NativeAttempt, task: &Task) -> Result<(), EvalError> {
+    fn write_input(
+        &self,
+        attempt_id: Uuid,
+        trial_name: &str,
+        prompt: &str,
+    ) -> Result<BufWriter<File>, HarborError> {
+        let root = self.root.join(trial_name);
+        let agent = root.join("agent");
+        fs::create_dir_all(&agent)?;
         let input = HarborInput {
             protocol_version: 1,
-            request_id: attempt
-                .paths
-                .root
-                .file_name()
-                .and_then(|name| name.to_str()),
+            request_id: Some(attempt_id.to_string()),
             kind: "input",
             payload: HarborInputPayload {
-                instruction: task.prompt(),
+                instruction: prompt,
             },
         };
         let mut bytes = serde_json::to_vec(&input)?;
         bytes.push(b'\n');
-        Self::write_file(&attempt.paths.agent.join("input.jsonl"), bytes)
+        Self::write_file(&agent.join("input.jsonl"), bytes)?;
+        Ok(BufWriter::new(File::create(agent.join("events.jsonl"))?))
     }
 
-    pub fn write_trial(
+    fn write_trial(
         &self,
-        attempt: &NativeAttempt,
-        task: &Task,
         result: &EvalResult,
-    ) -> Result<(), EvalError> {
+        trajectory: &AtifTrajectory,
+    ) -> Result<(), HarborError> {
+        let task = result.task();
+        let root = &result.artifacts.directory;
+        let agent = root.join("agent");
         let task_path = task.root().to_path_buf();
         let task_checksum = directory_hash(task.root())?;
         let task_digest = package_content_hash(task.root())?;
@@ -105,15 +310,15 @@ impl HarborArtifacts {
             extra_instruction_paths: Vec::new(),
             job_id: self.job_id,
         };
-        Self::write_json(&attempt.paths.root.join("config.json"), &config)?;
-        Self::write_json(&attempt.paths.trajectory, &result.trajectory)?;
+        Self::write_json(&root.join("config.json"), &config)?;
+        Self::write_json(&agent.join("trajectory.json"), trajectory)?;
         Self::write_json(
-            &attempt.paths.root.join("artifacts/manifest.json"),
+            &root.join("artifacts/manifest.json"),
             &Vec::<HarborArtifactManifestEntry>::new(),
         )?;
 
-        let trial_uri = Url::from_directory_path(&attempt.paths.root)
-            .map_err(|()| EvalError::InvalidTrialPath(attempt.paths.root.clone()))?
+        let trial_uri = Url::from_directory_path(root)
+            .map_err(|()| HarborError::InvalidTrialPath(root.clone()))?
             .to_string();
         let trial_result = HarborTrialResult {
             id: result.attempt_id,
@@ -152,12 +357,12 @@ impl HarborArtifacts {
             exception_info: None,
             step_results: None,
         };
-        Self::write_json(&attempt.paths.result, &trial_result)?;
-        Self::write_file(&attempt.paths.root.join("trial.log"), [])?;
-        Self::write_file(&attempt.paths.agent.join("stderr.log"), [])?;
+        Self::write_json(&root.join("result.json"), &trial_result)?;
+        Self::write_file(&root.join("trial.log"), [])?;
+        Self::write_file(&agent.join("stderr.log"), [])?;
 
         let lock = HarborTrialLock::new(task, result, &task_digest);
-        Self::write_json(&attempt.paths.root.join("lock.json"), &lock)?;
+        Self::write_json(&root.join("lock.json"), &lock)?;
         {
             let mut recorded = self
                 .recorded_trials
@@ -181,7 +386,7 @@ impl HarborArtifacts {
         self.write_job_metadata()
     }
 
-    pub fn write_job(&self, results: &[EvalResult]) -> Result<(), EvalError> {
+    fn write_job(&self, results: &[EvalResult]) -> Result<(), HarborError> {
         let now = Utc::now();
         let input_tokens = results
             .iter()
@@ -245,7 +450,7 @@ impl HarborArtifacts {
         Self::write_json(&self.root.join("result.json"), &job)
     }
 
-    fn write_job_metadata(&self) -> Result<(), EvalError> {
+    fn write_job_metadata(&self) -> Result<(), HarborError> {
         let recorded = self
             .recorded_trials
             .lock()
@@ -291,13 +496,13 @@ impl HarborArtifacts {
         )
     }
 
-    fn write_json(path: &Path, value: &impl Serialize) -> Result<(), EvalError> {
+    fn write_json(path: &Path, value: &impl Serialize) -> Result<(), HarborError> {
         let mut bytes = serde_json::to_vec_pretty(value)?;
         bytes.push(b'\n');
         Self::atomic_write(path, bytes)
     }
 
-    fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), EvalError> {
+    fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), HarborError> {
         let mut name: OsString = path
             .file_name()
             .map_or_else(|| OsString::from("artifact"), OsString::from);
@@ -308,7 +513,10 @@ impl HarborArtifacts {
         Ok(())
     }
 
-    fn write_file(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), EvalError> {
+    fn write_file(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), HarborError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(path, bytes)?;
         Ok(())
     }
@@ -325,7 +533,7 @@ fn harbor_float_key(value: f64) -> String {
 #[derive(Serialize)]
 struct HarborInput<'a> {
     protocol_version: u32,
-    request_id: Option<&'a str>,
+    request_id: Option<String>,
     #[serde(rename = "type")]
     kind: &'static str,
     payload: HarborInputPayload<'a>,

@@ -1,5 +1,5 @@
 [package]
-name = "nanoeval"
+name = "nanoeval-harbor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,17 +11,18 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Fast, library-first evaluation for Nanocodex agents"
+description = "Streaming Harbor and ATIF output for Nanoeval"
 
 [dependencies]
 chrono.workspace = true
-futures-util.workspace = true
-nanocodex.workspace = true
+ignore.workspace = true
+nanoeval.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-toml.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

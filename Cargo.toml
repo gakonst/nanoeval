@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanoeval", "crates/nanoeval", "crates/nanovm", "examples"]
+members = ["bin/nanoeval", "crates/nanoeval", "crates/nanoeval-harbor", "crates/nanovm", "examples"]
 default-members = ["bin/nanoeval"]
 resolver = "2"
 
@@ -26,6 +26,7 @@ ignore = "0.4.31"
 krun = { package = "libkrun", git = "https://github.com/containers/libkrun", branch = "main" }
 nanocodex = { version = "0.1.0", path = "../nanocodex/crates/nanocodex" }
 nanoeval = { version = "0.1.0", path = "crates/nanoeval" }
+nanoeval-harbor = { version = "0.1.0", path = "crates/nanoeval-harbor" }
 nanovm = { version = "0.1.0", path = "crates/nanovm" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }

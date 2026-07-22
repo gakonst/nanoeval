@@ -1,7 +1,10 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAiAuth, Thinking};
-use nanoeval::{EvalResult, Nanoeval, Task};
+use nanoeval::{
+    EvalEventKind, EvalEventStreamError, EvalResult, Nanoeval, NanoevalEventStream, Task,
+};
+use nanoeval_harbor::Harbor;
 
 const K: usize = 5;
 const TASKS: [&str; 3] = [
@@ -19,10 +22,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (first, second, third) = (first?, second?, third?);
     let agent = Nanocodex::builder(auth()?).thinking(Thinking::Low);
     let (eval, events) = Nanoeval::builder(agent)
-        .output_directory(output_directory)
+        .run_directory(output_directory)
         .max_concurrency(TASKS.len() * K)
         .build()?;
-    drop(events);
+    let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
+    let observer = tokio::spawn(observe(events.subscribe(), TASKS.len() * K));
 
     let (first, second, third) = tokio::try_join!(
         eval.task_n(first, K),
@@ -30,8 +34,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         eval.task_n(third, K),
     )?;
 
-    print_results(first.into_iter().chain(second).chain(third));
-    println!("Harbor jobs: {}", eval.output_directory().display());
+    let results = first
+        .into_iter()
+        .chain(second)
+        .chain(third)
+        .collect::<Vec<_>>();
+    let job = harbor.finish(results.clone()).await?;
+    observer.await??;
+    print_results(results);
+    println!("Harbor job: {}", job.directory().display());
     Ok(())
 }
 
@@ -57,11 +68,34 @@ fn auth() -> Result<OpenAiAuth, Box<dyn Error>> {
 fn print_results(results: impl IntoIterator<Item = EvalResult>) {
     for result in results {
         println!(
-            "{}: {:?} in {} ms ({} ATIF steps)",
-            result.trial_name,
-            result.status,
-            result.agent.metadata.duration_ms,
-            result.trajectory.steps.len(),
+            "{}: {:?} in {} ms",
+            result.trial_name, result.status, result.agent.metadata.duration_ms,
         );
     }
+}
+
+async fn observe(
+    mut events: NanoevalEventStream,
+    expected: usize,
+) -> Result<(), EvalEventStreamError> {
+    let mut completed = 0;
+    while completed < expected {
+        let Some(event) = events.recv().await? else {
+            break;
+        };
+        match &event.kind {
+            EvalEventKind::AttemptStarted { .. } => {
+                eprintln!("{}: started", event.trial_name);
+            }
+            EvalEventKind::Completed(result) => {
+                completed += 1;
+                eprintln!("{}: {:?}", event.trial_name, result.status);
+            }
+            EvalEventKind::Agent(_)
+            | EvalEventKind::VerifierStarted
+            | EvalEventKind::VerifierOutput { .. }
+            | EvalEventKind::VerifierCompleted(_) => {}
+        }
+    }
+    Ok(())
 }

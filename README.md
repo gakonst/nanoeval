@@ -18,7 +18,7 @@
 Nanoeval is a small Rust evaluation SDK for coding agents. It embeds
 [Nanocodex](https://github.com/gakonst/nanocodex) directly, creates a fresh
 agent session and disposable workspace for every attempt, runs the canonical
-task verifier, and retains the complete event stream and result bundle.
+task verifier, and publishes the complete typed event stream and result.
 
 The current native path invokes no Docker daemon, builds no task image, and
 installs no agent into a container. A complete passing attempt can be opened
@@ -42,8 +42,8 @@ That leads to a few deliberate choices:
   into every task image.
 - Every attempt receives a fresh Nanocodex session, tool runtime, workspace,
   event sequence, and verifier run.
-- Typed results and typed events are the runtime contract. Harbor and ATIF are
-  faithful retained representations of that data.
+- Typed results and typed events are the runtime contract. The optional Harbor
+  adapter records one subscription as Harbor and ATIF artifacts.
 - Native execution provides the fastest development loop for host-safe tasks.
 - Linux compatibility and isolation belong in a reusable, Docker-free worker
   built on libkrun, not in per-attempt image builds.
@@ -99,38 +99,100 @@ Nanocodex. Without `OPENAI_API_KEY`, it loads `${CODEX_HOME}/auth.json` or
 
 `Nanoeval` is a reusable evaluation recipe. It owns a cloneable
 `NanocodexBuilder`, not a live conversation. Each call to `task` builds an
-independent agent and attempt:
+independent agent and attempt. Core Nanoeval does not select an output format:
 
 ```rust,no_run
 use nanocodex::Nanocodex;
-use nanoeval::{Nanoeval, Task};
+use nanoeval::{EvalEventKind, EvalEventStreamError, Nanoeval, Task};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let task = Task::load("tasks/write-greeting")?;
 
-let (eval, mut events) = Nanoeval::builder(Nanocodex::builder("api-key"))
-    .output_directory("nanoeval-runs")
+let (eval, events) = Nanoeval::builder(Nanocodex::builder("api-key"))
+    .run_directory("nanoeval-native-runs")
     .max_concurrency(5)
     .build()?;
 
-tokio::spawn(async move {
-    while let Some(event) = events.recv().await {
-        // Forward typed attempt and agent events to your own observer.
-        drop(event);
+let mut observer = events.subscribe();
+let observer = tokio::spawn(async move {
+    while let Some(event) = observer.recv().await? {
+        if matches!(&event.kind, EvalEventKind::Completed(_)) {
+            break;
+        }
     }
+    Ok::<_, EvalEventStreamError>(())
 });
 
 let first = eval.task(task.clone()).await?;
 let five_fresh_attempts = eval.task_n(task, 5).await?;
-
-assert!(first.artifacts.result_json.is_file());
-assert_eq!(
-    first.trajectory.final_metrics.total_steps,
-    u32::try_from(first.trajectory.steps.len())?,
-);
+assert!(first.artifacts.workspace.is_dir());
+observer.await??;
 # drop(five_fresh_attempts);
 # Ok(())
 # }
+```
+
+The runnable core-only consumer is
+[`examples/src/bin/native_task.rs`](examples/src/bin/native_task.rs):
+
+```sh
+OPENAI_API_KEY=... cargo run -p nanoeval-examples --bin native-task
+```
+
+### Harbor adapter
+
+Harbor is a separate streaming adapter. Give it one subscription before
+starting any tasks. Application telemetry, a UI, or another exporter can drain
+another subscription concurrently without competing with Harbor:
+
+```rust,no_run
+# use nanocodex::Nanocodex;
+# use nanoeval::{EvalEventKind, EvalEventStreamError, Nanoeval, Task};
+# use nanoeval_harbor::Harbor;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let task = Task::load("tasks/write-greeting")?;
+let (eval, events) = Nanoeval::builder(Nanocodex::builder("api-key"))
+    .run_directory("nanoeval-runs")
+    .build()?;
+
+// Both subscriptions exist before the first attempt emits anything.
+let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
+let mut application_events = events.subscribe();
+let application = tokio::spawn(async move {
+    let mut observed = 0_u64;
+    while let Some(event) = application_events.recv().await? {
+        observed += 1;
+        if matches!(&event.kind, EvalEventKind::Completed(_)) {
+            break;
+        }
+    }
+    Ok::<_, EvalEventStreamError>(observed)
+});
+
+// Nanoeval executes the task and returns its native typed result. Meanwhile,
+// Harbor writes exact events and builds the ATIF trajectory incrementally.
+let result = eval.task(task).await?;
+
+// Finish waits until Harbor has processed this result's Completed event, then
+// commits the final job metadata. Pass every result belonging to this run.
+let job = harbor.finish(vec![result]).await?;
+let observed = application.await??;
+
+assert!(observed > 0);
+println!("Harbor job: {}", job.directory().display());
+# Ok(())
+# }
+```
+
+`run_directory("nanoeval-runs")` selects the jobs parent. `build()` creates one
+UUID-named native run beneath it, and `Harbor::new(eval.run())` explicitly
+attaches Harbor output to that run. `record(...)` starts draining immediately;
+`finish(...)` is finalization, not deferred event conversion.
+
+See [`examples/src/bin/harbor_task.rs`](examples/src/bin/harbor_task.rs):
+
+```sh
+OPENAI_API_KEY=... cargo run -p nanoeval-examples --bin harbor-task
 ```
 
 `task`, `task_n`, and `tasks` are the complete scheduling surface. Concurrency
@@ -155,7 +217,8 @@ let agent = Nanocodex::builder("api-key").thinking(Thinking::Low);
 let (eval, events) = Nanoeval::builder(agent)
     .max_concurrency(3 * K)
     .build()?;
-drop(events);
+let harbor = nanoeval_harbor::Harbor::new(eval.run())?
+    .record(events.subscribe())?;
 
 let (greeting, uppercase, todos) = tokio::try_join!(
     eval.task_n(greeting, K),
@@ -164,6 +227,8 @@ let (greeting, uppercase, todos) = tokio::try_join!(
 )?;
 
 assert_eq!(greeting.len() + uppercase.len() + todos.len(), 3 * K);
+# let results = greeting.into_iter().chain(uppercase).chain(todos).collect();
+# harbor.finish(results).await?;
 # Ok(())
 # }
 ```
@@ -192,26 +257,25 @@ NanocodexBuilder
        │ cloned per attempt
        ▼
    Nanoeval ─────────────────────────► NanoevalEvents
-       │                                  optional side channel
+       │                                  │ independent subscriptions
        │ task(task)
-       ▼
- fresh Nanocodex session ────────────► AgentEvents ──► events.jsonl
-       │
+       ▼                                  ├──► application observer
+ fresh Nanocodex session ────────────► AgentEvents
+       │                                  │
        │ standard tools in a fresh workspace
-       ▼
- canonical verifier
-       │
-       ├──► typed EvalResult
-       ├──► ATIF-v1.7 trajectory
-       └──► Harbor job and trial records
+       ▼                                  └──► nanoeval-harbor recorder
+ canonical verifier                           ├──► exact events.jsonl
+       │                                      ├──► ATIF-v1.7 trajectory
+       └──► typed EvalResult                  └──► Harbor job/trial records
 ```
 
 The evaluator can be reused indefinitely. Attempts never reuse conversation
 history, tool sessions, mutable workspace state, or event sequence numbers.
-Within one attempt, Nanoeval preserves the complete agent loop: the initial
-user prompt is one ATIF step and every Nanocodex model inference is a separate
-agent step containing that turn's message, reasoning, usage, tool calls, and
-matching observations.
+Within one attempt, Nanoeval publishes the complete agent loop in sequence.
+The Harbor adapter incrementally projects it into ATIF: the initial user prompt
+is one step and every Nanocodex model inference is a separate agent step
+containing that turn's message, reasoning, usage, tool calls, and matching
+observations.
 
 ## Tasks
 
@@ -238,7 +302,8 @@ host.
 
 ## Harbor-compatible output
 
-Nanoeval writes a normal Harbor-shaped jobs directory:
+The optional `nanoeval-harbor` recorder writes a normal Harbor-shaped jobs
+directory while attempts execute:
 
 ```text
 nanoeval-runs/
@@ -270,12 +335,11 @@ harbor view nanoeval-runs --jobs
 
 The current output validates with Harbor's own `JobConfig`, `JobLock`,
 `JobResult`, `TrialConfig`, `TrialLock`, `TrialResult`, and ATIF-v1.7
-`Trajectory` models. The typed `EvalResult` owns that `AtifTrajectory`; Harbor
-only serializes the completed result. ATIF is accumulated directly from the
-ordered Nanocodex event stream, with one step per model turn and same-step tool
-calls and observations. Nanoeval also matches Harbor's Python `dirhash` task
-checksum and Packager content digest, so result and lock identity agree with
-Harbor.
+`Trajectory` models. The adapter accumulates ATIF directly from its independent
+subscription to the ordered Nanoeval event stream, with one step per model turn
+and same-step tool calls and observations. It also matches Harbor's Python
+`dirhash` task checksum and Packager content digest, so result and lock identity
+agree with Harbor.
 
 Harbor remains an output and inspection boundary; its Python runtime and Docker
 executor are not dependencies of an attempt.
@@ -312,7 +376,8 @@ The repository follows the same library-first split as Nanocodex:
 
 | Crate | Responsibility |
 | --- | --- |
-| `nanoeval` | Tasks, attempts, verification, scheduling, typed results, and Harbor/ATIF retention |
+| `nanoeval` | Tasks, attempts, verification, scheduling, native run state, and typed event subscriptions |
+| `nanoeval-harbor` | Streaming Harbor job/trial persistence and ATIF projection |
 | `nanovm` | libkrun configuration, host capabilities, guest commands, and the low-level VMM lifecycle |
 | `nanoeval-bin` | Thin CLI over the libraries |
 | `nanoeval-examples` | Compiling public API consumers |
