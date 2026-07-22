@@ -12,9 +12,12 @@ description = "Public Nanoeval and NanoVM library examples"
 
 [dependencies]
 nanocodex.workspace = true
+nanocodex-vm.workspace = true
 nanoeval.workspace = true
 nanoeval-harbor.workspace = true
 nanovm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [[bin]]
@@ -44,6 +47,10 @@ path = "src/bin/thinking_sweep.rs"
 [[bin]]
 name = "tool-sweep"
 path = "src/bin/tool_sweep.rs"
+
+[[bin]]
+name = "vm-tools"
+path = "src/bin/vm_tools.rs"
 
 [lints]
 workspace = true

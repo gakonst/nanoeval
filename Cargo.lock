@@ -1842,6 +1842,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocodex-vm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nanocodex-tools",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "nanoeval"
 version = "0.1.0"
 dependencies = [
@@ -1865,11 +1877,13 @@ dependencies = [
  "dotenvy",
  "eyre",
  "nanocodex",
+ "nanocodex-vm",
  "nanoeval",
  "nanoeval-harbor",
  "nanovm",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
  "tokio",
 ]
 
@@ -1878,9 +1892,12 @@ name = "nanoeval-examples"
 version = "0.1.0"
 dependencies = [
  "nanocodex",
+ "nanocodex-vm",
  "nanoeval",
  "nanoeval-harbor",
  "nanovm",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

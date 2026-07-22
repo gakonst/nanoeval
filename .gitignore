@@ -3,5 +3,6 @@
 /.nanoeval-smoke/
 /.nanoeval-comparison/
 /.nanoeval-view/
+/.nanoeval-vm-*/
 /nanoeval-runs/
 /nanoeval-native-runs/

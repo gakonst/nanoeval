@@ -78,6 +78,18 @@ cargo run -- run \
   --thinking low
 ```
 
+Run the same evaluator with workspace tools inside independent libkrun VMs by
+supplying a prepared rootfs containing `nanocodex-vm-guest`:
+
+```sh
+cargo run -- run \
+  --task tasks/write-greeting \
+  --trials 5 \
+  --concurrency 5 \
+  --thinking low \
+  --vm-rootfs .cache/rootfs/alpine-3.24.1
+```
+
 Every `--task` is one eval and `--trials` applies to each one. Run the complete
 three-eval, `k=5` suite with:
 
@@ -318,6 +330,83 @@ is one step and every Nanocodex model inference is a separate agent step
 containing that turn's message, reasoning, usage, tool calls, and matching
 observations.
 
+### VM-owned standard tools
+
+`nanocodex-vm` replaces only the standard tools whose effects must occur in the
+guest. Their names and model-visible definitions come directly from
+`nanocodex-tools`; the VM crate does not maintain copies of their JSON schemas
+or the `apply_patch` grammar. Code Mode remains the host-side dispatcher and
+`update_plan` remains a normal host tool:
+
+```rust,no_run
+# use nanocodex::{Tools, ToolsBuildError, UpdatePlanTool};
+# use nanocodex_vm::{VmToolClient, VmTools};
+# fn tools(client: impl VmToolClient + 'static) -> Result<Tools, ToolsBuildError> {
+let vm = VmTools::new(client);
+Tools::builder()
+    .without_defaults()
+    .working_directory("/workspace")
+    .default_shell("sh")
+    .tool(vm.exec_command_tool())
+    .tool(vm.write_stdin_tool())
+    .tool(vm.apply_patch_tool())
+    .tool(vm.view_image_tool())
+    .tool(UpdatePlanTool::new())
+    .build()
+# }
+```
+
+`VmToolSession` is the concrete retained client. It speaks newline-framed,
+strictly typed requests over libkrun's piped virtio console to a statically
+linked Linux guest runtime. The guest constructs the canonical
+`nanocodex-tools::ToolRuntime`, so shell session IDs, subprocesses, patches,
+and image reads are guest-owned; complete `ToolExecution` values cross back to
+the host without flattening known fields into `serde_json::Value`.
+
+Nanoeval exposes the per-attempt builder boundary needed to bind that session:
+
+```rust,ignore
+let (eval, events) = Nanoeval::builder(agent)
+    .attempt_agent(move |attempt, builder| {
+        // Materialize a rootfs at attempt.directory(), then start its VMM.
+        let vm = VmTools::new(VmToolSession::spawn(&mut vmm_command(attempt))?);
+        let tools = Tools::builder()
+            .without_defaults()
+            .working_directory("/workspace")
+            .default_shell("sh")
+            .tool(vm.exec_command_tool())
+            .tool(vm.write_stdin_tool())
+            .tool(vm.apply_patch_tool())
+            .tool(vm.view_image_tool())
+            .tool(UpdatePlanTool::new())
+            .build()?;
+        Ok(builder.tools(tools))
+    })
+    .max_concurrency(15)
+    .build()?;
+```
+
+The working-directory and shell overrides are model context supplied by the
+general Nanocodex tools recipe; they do not special-case VM argument rewriting.
+Code Mode and `update_plan` stay on the host. The complete runnable rootfs and
+VMM composition is in [`bin/nanoeval/src/eval.rs`](bin/nanoeval/src/eval.rs),
+while [`vm-tools`](examples/src/bin/vm_tools.rs) directly exercises all four
+tools through one real VM without a model call.
+
+On the July 21, 2026 Apple Silicon development host, the VM-backed three-task
+`k=5`, concurrency-15 run completed all 15 Harbor-recorded trials in **21.10
+seconds**. All 15 verifiers passed. The trajectories contain 15 guest
+`apply_patch` calls and 29 guest `exec_command` calls, and all 29 explicit
+working directories are `/workspace`. Rootfs materialization plus agent setup
+and VMM-child spawn averaged 63.9 ms per attempt and reached 95.2 ms at the
+maximum.
+
+This is a correctness and throughput proof, not the final sandbox: it copies a
+trusted 15 MiB Alpine directory into every retained attempt and exposes that
+directory through writable virtiofs. The 15-trial job therefore occupies 232
+MiB. Immutable rootfs snapshots, a private CoW workspace, guest confinement,
+and a warm multi-attempt VM pool remain the next isolation/storage slice.
+
 ## Tasks
 
 `Task::load` reads a typed Terminal-Bench 2.1 task directory:
@@ -417,6 +506,7 @@ The repository follows the same library-first split as Nanocodex:
 
 | Crate | Responsibility |
 | --- | --- |
+| `nanocodex-vm` | Exact standard Nanocodex tool contracts proxied to a VM-owned executor |
 | `nanoeval` | Tasks, attempts, verification, scheduling, native job state, and typed event subscriptions |
 | `nanoeval-harbor` | Streaming Harbor job/trial persistence and ATIF projection |
 | `nanovm` | libkrun configuration, host capabilities, guest commands, and the low-level VMM lifecycle |

@@ -13,7 +13,7 @@ pub use atif::{
     AtifRuntimeMetrics, AtifSchemaVersion, AtifSource, AtifStep, AtifStepExtra, AtifToolCall,
     AtifToolCallExtra, AtifTrajectory,
 };
-pub use evaluator::{EvalError, Nanoeval, NanoevalBuilder};
+pub use evaluator::{EvalAttempt, EvalError, Nanoeval, NanoevalBuilder};
 pub use event::{
     EvalEvent, EvalEventKind, EvalEventStreamError, NanoevalEventStream, NanoevalEvents,
 };

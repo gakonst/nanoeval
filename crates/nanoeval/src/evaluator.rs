@@ -1,4 +1,10 @@
-use std::{num::ParseFloatError, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    num::ParseFloatError,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
@@ -28,6 +34,7 @@ pub struct NanoevalBuilder {
     nanocodex: NanocodexBuilder<StandardResponses>,
     output_directory: PathBuf,
     max_concurrency: usize,
+    attempt_agent: Option<AttemptAgentFactory>,
 }
 
 struct NanoevalInner {
@@ -36,6 +43,26 @@ struct NanoevalInner {
     concurrency: Arc<Semaphore>,
     max_concurrency: usize,
     events: broadcast::Sender<Arc<EvalEvent>>,
+    attempt_agent: Option<AttemptAgentFactory>,
+}
+
+type AttemptError = Box<dyn Error + Send + Sync + 'static>;
+type AttemptAgentFactory = Arc<
+    dyn for<'a> Fn(
+            EvalAttempt<'a>,
+            NanocodexBuilder<StandardResponses>,
+        ) -> Result<NanocodexBuilder<StandardResponses>, AttemptError>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Immutable paths and task metadata available while configuring one attempt.
+#[derive(Clone, Copy)]
+pub struct EvalAttempt<'a> {
+    task: &'a Task,
+    directory: &'a Path,
+    workspace: &'a Path,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +81,9 @@ pub enum EvalError {
 
     #[error("Nanocodex failed: {0}")]
     Nanocodex(#[from] NanocodexError),
+
+    #[error("failed to configure attempt agent: {0}")]
+    AttemptAgent(#[source] AttemptError),
 
     #[error("agent exceeded its {0:?} timeout")]
     AgentTimeout(Duration),
@@ -81,6 +111,7 @@ impl Nanoeval {
             nanocodex,
             output_directory: PathBuf::from("nanoeval-runs"),
             max_concurrency: 1,
+            attempt_agent: None,
         }
     }
 
@@ -216,13 +247,24 @@ impl Nanoeval {
         attempt: &NativeAttempt,
     ) -> Result<AgentExecution, EvalError> {
         let setup_started = Utc::now();
-        let (agent, mut events) = self
+        let mut builder = self
             .inner
             .nanocodex
             .clone()
             .workspace(&attempt.paths.workspace)
-            .session_id(emitter.attempt_id.to_string())
-            .build()?;
+            .session_id(emitter.attempt_id.to_string());
+        if let Some(factory) = &self.inner.attempt_agent {
+            builder = factory(
+                EvalAttempt {
+                    task,
+                    directory: &attempt.paths.root,
+                    workspace: &attempt.paths.workspace,
+                },
+                builder,
+            )
+            .map_err(EvalError::AttemptAgent)?;
+        }
+        let (agent, mut events) = builder.build()?;
         let setup_timing = PhaseTiming::finished(setup_started);
         let execution_started = Utc::now();
         let turn = agent.prompt(task.prompt()).await?;
@@ -275,6 +317,29 @@ impl NanoevalBuilder {
         self
     }
 
+    /// Configures the fresh Nanocodex builder for each attempt.
+    ///
+    /// The factory runs after the disposable workspace is populated and before
+    /// the agent is built. This is the boundary for attempt-owned resources
+    /// such as a retained VM tool session and its guest-visible workspace.
+    #[must_use]
+    pub fn attempt_agent<F, E>(mut self, factory: F) -> Self
+    where
+        F: for<'a> Fn(
+                EvalAttempt<'a>,
+                NanocodexBuilder<StandardResponses>,
+            ) -> Result<NanocodexBuilder<StandardResponses>, E>
+            + Send
+            + Sync
+            + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        self.attempt_agent = Some(Arc::new(move |attempt, builder| {
+            factory(attempt, builder).map_err(|error| Box::new(error) as AttemptError)
+        }));
+        self
+    }
+
     /// Builds a reusable evaluator and a source of independent event streams.
     ///
     /// # Errors
@@ -294,10 +359,28 @@ impl NanoevalBuilder {
                     concurrency: Arc::new(Semaphore::new(self.max_concurrency)),
                     max_concurrency: self.max_concurrency,
                     events: event_sender.clone(),
+                    attempt_agent: self.attempt_agent,
                 }),
             },
             NanoevalEvents::new(event_sender),
         ))
+    }
+}
+
+impl EvalAttempt<'_> {
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        self.task
+    }
+
+    #[must_use]
+    pub const fn directory(&self) -> &Path {
+        self.directory
+    }
+
+    #[must_use]
+    pub const fn workspace(&self) -> &Path {
+        self.workspace
     }
 }
 

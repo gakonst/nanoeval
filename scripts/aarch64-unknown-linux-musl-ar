@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+if [ "$(uname -s)" = "Darwin" ]; then
+    exec "$(brew --prefix llvm)/bin/llvm-ar" "$@"
+fi
+
+exec ar "$@"

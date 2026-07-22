@@ -1,6 +1,6 @@
 # Nanoeval plan
 
-Status: the first native vertical slice is complete. A reusable `Nanoeval`
+Status: the native vertical slice and first real libkrun eval slice are complete. A reusable `Nanoeval`
 accepts a `NanocodexBuilder`, creates a fresh session and workspace per task,
 runs a canonical verifier, and fans sequenced typed events out to independent
 loss-aware subscriptions. The separate `nanoeval-harbor` adapter records one
@@ -13,8 +13,11 @@ from the live event stream with one step per model turn rather than a lossy
 two-step summary. The native concurrency milestone is also complete: the public
 library example ran three tasks at `k=5` as 15 concurrent attempts, passed all
 15 verifiers, and retained a Harbor-valid 15-trial job in 22.45 seconds from a
-warm binary. The minimal libkrun bring-up remains separate from the attempt
-runner.
+warm binary. The VM-backed version also passes all 15 trials with one retained
+VM and Nanocodex session per attempt, 15 concurrent VMs, Harbor-compatible
+output, and 21.10 seconds end to end. Agent/VMM setup averaged 63.9 ms. This
+proof uses copied trusted rootfs directories and writable virtiofs; it is not
+yet the scored isolation design.
 
 ## Library boundaries
 
@@ -23,6 +26,8 @@ The repository follows the same library-first layout as Nanocodex:
 - `nanovm` owns virtualization: configuration, host capability discovery,
   libkrun/KVM/HVF lifecycle, the future VMM process protocol, execution, and
   pause/resume;
+- `nanocodex-vm` owns the host-side Nanocodex tool proxies, typed console
+  protocol, retained VMM session, and canonical guest tool runtime;
 - `nanoeval` owns evaluation: task loading, preparation, attempts, verification,
   native job state, typed event subscriptions, and scheduling;
 - `nanoeval-harbor` owns the explicit streaming Harbor and ATIF projection;
@@ -31,9 +36,9 @@ The repository follows the same library-first layout as Nanocodex:
 
 The public composition starts from a cloneable `NanocodexBuilder`, not a live
 session. `Nanoeval::task` clones that recipe and binds a fresh session, tool
-runtime, workspace, and session ID for every attempt. A future VM backend will
-be selected in the builder recipe through `tools_factory`; Nanoeval must not
-retrofit tools onto an already-built agent.
+runtime, workspace, and session ID for every attempt. `attempt_agent` applies
+per-attempt resources to that fresh builder before it becomes a live agent; it
+does not retrofit tools onto an already-built session.
 
 ## Thesis
 
@@ -218,11 +223,15 @@ representative trace replay, not intuition.
 
 Both separated placements use Nanocodex's general `tools_factory` to install
 the standard tool names with VM-aware implementations. No Nanoeval-specific
-`WorkspaceBackend` trait is needed. Nanocodex must first make its default
-workspace handlers genuinely removable and allow replacements with their
-standard names. The tools cover bounded exec, persistent stdin sessions,
-cancellation, patch/file operations, and image reads. With trusted in-worker
-placement their implementation uses local Linux IPC rather than a VM hop.
+`WorkspaceBackend` trait is needed. `nanocodex-tools` owns the canonical
+standard names, definitions, schemas, and apply-patch grammar; both its native
+handlers and `nanocodex-vm` consume those contracts. `nanocodex-vm` proxies
+`exec_command`, `write_stdin`, `apply_patch`, and `view_image` through one
+clone-cheap VM tool client. Code Mode and `update_plan` remain on the host.
+The future concrete VM client covers bounded exec, guest-owned persistent
+sessions, cancellation, patch/file operations, and image reads. With trusted
+in-worker placement its implementation uses local Linux IPC rather than a VM
+hop.
 
 The model loop, retries, Responses WebSocket, typed history, code mode, and
 event semantics stay in Nanocodex. Nanoeval owns sandbox capabilities, attempt
@@ -296,6 +305,42 @@ is a new attempt with explicit lineage and never overwrites its parent.
 The scheduler should have separate permits for model attempts and expensive VM
 or verifier work only after measurements show that one global limit leaves
 resources idle or causes contention.
+
+## Durable finite jobs
+
+Automatic completion and restart are defined only for a finite `EvalPlan`.
+The existing reusable `eval.task(...)` and `eval.task_n(...)` calls remain
+useful ad hoc operations, but an open-ended library object cannot infer when a
+caller has finished adding work and therefore cannot seal itself automatically.
+
+The durable CLI contract will be:
+
+```text
+nanoeval run ...    resume the matching active plan, or create and execute it
+nanoeval run        resume the retained active plan after interruption
+nanoeval start ...  require no active job, then create and execute a fresh plan
+nanoeval end        request cancellation and seal the active job as stopped
+nanoeval status     inspect the active job without mutating it
+```
+
+One atomic active-job pointer exists per output directory. A job retains an
+immutable plan, an atomic state snapshot, and an append-only typed transition
+journal. The stable trial slot is task identity × agent variant identity ×
+one-based ordinal. Each execution of that slot has a fresh execution ID,
+Nanocodex session, tool runtime, event sequence, and workspace.
+
+After Ctrl-C, completed slots remain committed and incomplete slots are
+interrupted. The next `run` skips completed slots and starts fresh executions
+for incomplete slots; it never resumes an interrupted conversation or dirty
+workspace. A live executor lease prevents two CLI processes from executing the
+same job concurrently. `end` prevents new claims, cancels live work, waits for
+cleanup, and preserves every completed result.
+
+Native state is authoritative. Events are durably appended before live fanout,
+and Harbor must be rebuildable from the retained plan, journal, and typed
+results rather than owning the only copy of them. Thinking and tool sweeps use
+caller-defined stable variant and tool-profile IDs so resume can reject a
+changed plan without attempting to hash opaque builder closures.
 
 ## Measurement model
 
@@ -443,13 +488,16 @@ artifact divergence.
 
 ## Immediate next experiment
 
-Do not build the full runner yet. Next:
+Do not build the full runner yet. Continue two narrow tracks:
 
-1. turn the one-shot guest command into a tiny, long-lived guest supervisor
+1. make the finite `EvalPlan` the durable native execution source of truth and
+   implement `run` resume, `start`, `end`, and stale-executor recovery;
+2. turn the one-shot guest command into a tiny, long-lived guest supervisor
    reachable over a libkrun console or vsock channel;
-2. measure 100 in-guest process launches, streamed output, cancellation, and
+3. connect its concrete client to the existing `nanocodex-vm` proxies and
+   measure 100 in-guest process launches, streamed output, cancellation, and
    cleanup without rebooting the VM; and
-3. inventory every pinned Terminal-Bench 2.1 OCI manifest architecture before
+4. inventory every pinned Terminal-Bench 2.1 OCI manifest architecture before
    building the image materializer.
 
 Those results decide whether one warm libkrun VM should multiplex attempts or
