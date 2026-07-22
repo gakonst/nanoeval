@@ -16,7 +16,8 @@ const PACKAGE_DIRECTORIES: [&str; 4] = ["environment", "tests", "solution", "ste
 /// `TrialResult.task_checksum`.
 pub(crate) fn directory_hash(root: &Path) -> Result<String, HarborError> {
     let mut ancestors = HashSet::new();
-    hash_directory(root, &mut ancestors)?.ok_or_else(|| HarborError::EmptyTask(root.to_path_buf()))
+    hash_directory(root, &mut ancestors, &|path| fs::canonicalize(path))?
+        .ok_or_else(|| HarborError::EmptyTask(root.to_path_buf()))
 }
 
 /// Matches Harbor's `Packager.compute_content_hash`, which is recorded with a
@@ -53,9 +54,10 @@ pub(crate) fn package_content_hash(root: &Path) -> Result<String, HarborError> {
 fn hash_directory(
     directory: &Path,
     ancestors: &mut HashSet<PathBuf>,
+    canonicalize: &impl Fn(&Path) -> std::io::Result<PathBuf>,
 ) -> Result<Option<String>, HarborError> {
-    let canonical = fs::canonicalize(directory)?;
-    if !ancestors.insert(canonical) {
+    let canonical = canonicalize(directory)?;
+    if !ancestors.insert(canonical.clone()) {
         return Err(HarborError::CyclicTaskDirectory(directory.to_path_buf()));
     }
 
@@ -67,7 +69,7 @@ fn hash_directory(
             let metadata = fs::metadata(&path)?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if metadata.is_dir() {
-                if let Some(hash) = hash_directory(&path, ancestors)? {
+                if let Some(hash) = hash_directory(&path, ancestors, canonicalize)? {
                     descriptors.push(format!("dirhash:{hash}\0name:{name}"));
                 }
             } else if metadata.is_file() {
@@ -82,7 +84,8 @@ fn hash_directory(
         Ok(Some(hex_digest(descriptors.join("\0\0").as_bytes())))
     })();
 
-    ancestors.remove(&fs::canonicalize(directory)?);
+    let removed = ancestors.remove(&canonical);
+    debug_assert!(removed);
     result
 }
 
@@ -166,5 +169,41 @@ mod tests {
             package_content_hash(&task).unwrap(),
             "e1a05661b2068b6f93e0874941d1fc930604d5c58965eacbc5cc4b4a95882d59"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_original_ancestor_when_directory_resolves_differently() {
+        use std::{cell::Cell, collections::HashSet, fs, os::unix::fs::symlink};
+
+        use tempfile::tempdir;
+
+        use super::hash_directory;
+
+        let workspace = tempdir().unwrap();
+        let original = workspace.path().join("original");
+        let replacement = workspace.path().join("replacement");
+        let task = workspace.path().join("task");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join("selected.txt"), b"replacement").unwrap();
+        symlink(&original, &task).unwrap();
+        let expected_hash = directory_hash(&replacement).unwrap();
+
+        let switched = Cell::new(false);
+        let canonicalize = |path: &Path| {
+            let canonical = fs::canonicalize(path)?;
+            if path == task && !switched.replace(true) {
+                fs::remove_file(&task)?;
+                symlink(&replacement, &task)?;
+            }
+            Ok(canonical)
+        };
+        let mut ancestors = HashSet::new();
+
+        let hash = hash_directory(&task, &mut ancestors, &canonicalize).unwrap();
+
+        assert_eq!(hash.as_deref(), Some(expected_hash.as_str()));
+        assert!(ancestors.is_empty());
     }
 }
