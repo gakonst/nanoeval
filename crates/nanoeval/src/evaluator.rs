@@ -9,14 +9,12 @@ use std::{
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use nanocodex::{AgentEvent, AgentEventKind, NanocodexBuilder, NanocodexError, StandardResponses};
-use serde::{Deserialize, Serialize};
 use tokio::{sync::AcquireError, sync::Semaphore, time::timeout};
 use uuid::Uuid;
 
 use crate::{
-    AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalResult, EvalStatus, EvalTiming,
-    NanoevalEvents, PhaseTiming, Task,
-    harbor::{HarborArtifacts, HarborEventSummary},
+    AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalResult, EvalStatus,
+    EvalTiming, NanoevalEvents, PhaseTiming, Task, atif::AtifBuilder, harbor::HarborArtifacts,
     native::NativeAttempt,
 };
 
@@ -176,6 +174,7 @@ impl Nanoeval {
             EvalEventKind::VerifierCompleted(verifier.result.clone()),
         );
 
+        let trajectory = agent.atif.finish(&task, &agent.result);
         let result = EvalResult {
             attempt_id,
             task_name: task.name().to_owned(),
@@ -186,6 +185,7 @@ impl Nanoeval {
                 EvalStatus::Failed
             },
             agent: agent.result,
+            trajectory,
             verifier: verifier.result,
             timing: EvalTiming {
                 started_at,
@@ -204,9 +204,7 @@ impl Nanoeval {
                 result_json: attempt.paths.result.clone(),
             },
         };
-        self.inner
-            .harbor
-            .write_trial(&attempt, &task, &result, &agent.event_summary)?;
+        self.inner.harbor.write_trial(&attempt, &task, &result)?;
         {
             let mut results = self
                 .inner
@@ -242,7 +240,7 @@ impl Nanoeval {
         let execution_started = Utc::now();
         let turn = agent.prompt(task.prompt()).await?;
         let control = turn.control();
-        let mut event_summary = HarborEventSummary::default();
+        let mut atif = AtifBuilder::default();
         let event_result = timeout(task.agent_timeout(), async {
             let file = std::fs::File::create(&attempt.paths.events)?;
             let mut writer = BufWriter::new(file);
@@ -252,7 +250,7 @@ impl Nanoeval {
                 writer.write_all(b"\n")?;
                 writer.flush()?;
                 let terminal = event.kind.is_terminal();
-                event_summary.observe(&event)?;
+                atif.apply(&event)?;
                 self.emit(attempt_id, task.name(), EvalEventKind::Agent(event.clone()));
                 if terminal {
                     let result = turn.result().await?;
@@ -270,7 +268,7 @@ impl Nanoeval {
         drop(agent);
         Ok(AgentExecution {
             result: AgentResult::from_terminal(turn_result.final_message, &terminal_event)?,
-            event_summary,
+            atif,
             setup_timing,
             execution_timing: PhaseTiming::finished(execution_started),
         })
@@ -287,7 +285,7 @@ impl Nanoeval {
 
 struct AgentExecution {
     result: AgentResult,
-    event_summary: HarborEventSummary,
+    atif: AtifBuilder,
     setup_timing: PhaseTiming,
     execution_timing: PhaseTiming,
 }
@@ -337,16 +335,15 @@ impl AgentResult {
         if event.kind != AgentEventKind::RunCompleted {
             return Err(EvalError::AgentEventsClosed);
         }
-        let terminal: NanocodexTerminalPayload = serde_json::from_str(event.payload.get())?;
-        let metadata = serde_json::to_value(&terminal)?;
+        let metadata: AgentMetadata = serde_json::from_str(event.payload.get())?;
         Ok(Self {
             final_message,
-            model: terminal.model,
-            effort: terminal.effort,
-            model_calls: terminal.model_calls,
-            tool_calls: terminal.tool_calls,
-            usage: terminal.usage,
-            cost_usd: terminal.cost_usd,
+            model: metadata.model.clone(),
+            effort: metadata.effort.clone(),
+            model_calls: metadata.model_calls,
+            tool_calls: metadata.tool_calls,
+            usage: metadata.usage.clone(),
+            cost_usd: metadata.cost_usd,
             metadata,
         })
     }
@@ -359,43 +356,4 @@ impl PhaseTiming {
             finished_at: Utc::now(),
         }
     }
-}
-
-#[derive(Deserialize, Serialize)]
-struct NanocodexTerminalPayload {
-    status: TerminalStatus,
-    model: String,
-    effort: String,
-    transport: String,
-    orchestration: String,
-    duration_ms: u64,
-    duration_ns: u64,
-    model_calls: u32,
-    steers: u32,
-    compactions: u32,
-    tool_calls: u32,
-    connection_attempts: u32,
-    websocket_reconnects: u32,
-    response_attempts: u32,
-    response_retries: u32,
-    connection_duration_ns: u64,
-    retry_backoff_duration_ns: u64,
-    model_duration_ns: u64,
-    warmup_duration_ns: u64,
-    tool_work_duration_ns: u64,
-    tool_wall_duration_ns: u64,
-    usage: crate::UsageTotals,
-    warmup_usage: crate::UsageTotals,
-    #[serde(rename = "last_response_id", skip_serializing)]
-    _last_response_id: Option<String>,
-    cost_usd: Option<f64>,
-    cost_status: String,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TerminalStatus {
-    Completed,
-    Failed,
-    Cancelled,
 }

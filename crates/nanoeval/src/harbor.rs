@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -7,14 +7,12 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use nanocodex::{AgentEvent, AgentEventKind};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    EvalError, EvalResult, PhaseTiming, Task,
+    AgentMetadata, EvalError, EvalResult, PhaseTiming, Task,
     harbor_checksum::{directory_hash, package_content_hash},
     native::NativeAttempt,
 };
@@ -27,59 +25,6 @@ pub(crate) struct HarborArtifacts {
     jobs_dir: PathBuf,
     max_concurrency: usize,
     recorded_trials: Mutex<Vec<HarborRecordedTrial>>,
-}
-
-#[derive(Default)]
-pub(crate) struct HarborEventSummary {
-    session_id: Option<String>,
-    reasoning: String,
-    tool_calls: Vec<AtifToolCall>,
-    tool_call_ids: BTreeSet<String>,
-    observations: Vec<AtifObservationResult>,
-}
-
-impl HarborEventSummary {
-    pub fn observe(&mut self, event: &AgentEvent) -> Result<(), serde_json::Error> {
-        if self.session_id.is_none() {
-            self.session_id = Some(event.request_id.to_string());
-        }
-        if event.kind == AgentEventKind::ReasoningSummaryDelta {
-            let payload = serde_json::from_str::<ReasoningSummaryPayload>(event.payload.get())?;
-            if let Some(text) = payload.into_text() {
-                self.reasoning.push_str(&text);
-            }
-        }
-        if event.kind == AgentEventKind::ToolCall {
-            let payload = serde_json::from_str::<ToolCallPayload>(event.payload.get())?;
-            let arguments = match payload.arguments {
-                Value::Object(arguments) => Value::Object(arguments),
-                raw => Value::Object(serde_json::Map::from_iter([("raw".to_owned(), raw)])),
-            };
-            self.tool_call_ids.insert(payload.call_id.clone());
-            self.tool_calls.push(AtifToolCall {
-                tool_call_id: payload.call_id,
-                function_name: payload.tool,
-                arguments,
-                extra: AtifToolCallExtra {
-                    model_call_index: payload.model_call_index,
-                },
-            });
-        }
-        if event.kind == AgentEventKind::ToolResult {
-            let payload = serde_json::from_str::<ToolResultPayload>(event.payload.get())?;
-            if self.tool_call_ids.contains(&payload.call_id) {
-                self.observations.push(AtifObservationResult {
-                    source_call_id: payload.call_id,
-                    content: serde_json::to_string(&payload.result)?,
-                    extra: AtifObservationExtra {
-                        status: payload.status,
-                        duration_ns: payload.duration_ns,
-                    },
-                });
-            }
-        }
-        Ok(())
-    }
 }
 
 impl HarborArtifacts {
@@ -136,7 +81,6 @@ impl HarborArtifacts {
         attempt: &NativeAttempt,
         task: &Task,
         result: &EvalResult,
-        event_summary: &HarborEventSummary,
     ) -> Result<(), EvalError> {
         let task_path = task.root().to_path_buf();
         let task_checksum = directory_hash(task.root())?;
@@ -162,10 +106,7 @@ impl HarborArtifacts {
             job_id: self.job_id,
         };
         Self::write_json(&attempt.paths.root.join("config.json"), &config)?;
-        Self::write_json(
-            &attempt.paths.trajectory,
-            &HarborTrajectory::from_summary(task, result, event_summary),
-        )?;
+        Self::write_json(&attempt.paths.trajectory, &result.trajectory)?;
         Self::write_json(
             &attempt.paths.root.join("artifacts/manifest.json"),
             &Vec::<HarborArtifactManifestEntry>::new(),
@@ -658,7 +599,7 @@ struct HarborAgentResult<'a> {
     n_output_tokens: u64,
     cost_usd: Option<f64>,
     rollout_details: Option<Vec<HarborRolloutDetail>>,
-    metadata: &'a Value,
+    metadata: &'a AgentMetadata,
 }
 
 #[derive(Serialize)]
@@ -709,363 +650,3 @@ struct HarborAgentDatasetStats {
 
 #[derive(Serialize)]
 struct HarborMetric {}
-
-#[derive(Serialize)]
-struct HarborTrajectory<'a> {
-    schema_version: AtifSchemaVersion,
-    session_id: &'a str,
-    agent: AtifAgent<'a>,
-    steps: [AtifStep<'a>; 2],
-    final_metrics: AtifFinalMetrics<'a>,
-}
-
-impl<'a> HarborTrajectory<'a> {
-    fn from_summary(
-        task: &'a Task,
-        result: &'a EvalResult,
-        summary: &'a HarborEventSummary,
-    ) -> Self {
-        let session_id = summary.session_id.as_deref().unwrap_or_default();
-        let reasoning = (!summary.reasoning.is_empty()).then(|| summary.reasoning.clone());
-        Self {
-            schema_version: AtifSchemaVersion::V1_7,
-            session_id,
-            agent: AtifAgent {
-                name: "nanocodex",
-                version: env!("CARGO_PKG_VERSION"),
-                model_name: &result.agent.model,
-                extra: AtifAgentExtra {
-                    transport: metadata_string(&result.agent.metadata, "transport"),
-                    orchestration: metadata_string(&result.agent.metadata, "orchestration"),
-                },
-            },
-            steps: [
-                AtifStep {
-                    step_id: 1,
-                    source: AtifSource::User,
-                    model_name: None,
-                    reasoning_effort: None,
-                    message: task.prompt(),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    observation: None,
-                    metrics: None,
-                    llm_call_count: None,
-                    extra: None,
-                },
-                AtifStep {
-                    step_id: 2,
-                    source: AtifSource::Agent,
-                    model_name: Some(&result.agent.model),
-                    reasoning_effort: Some(&result.agent.effort),
-                    message: &result.agent.final_message,
-                    reasoning_content: reasoning,
-                    tool_calls: (!summary.tool_calls.is_empty())
-                        .then_some(summary.tool_calls.as_slice()),
-                    observation: (!summary.observations.is_empty()).then_some(AtifObservation {
-                        results: summary.observations.as_slice(),
-                    }),
-                    metrics: Some(AtifMetrics {
-                        prompt_tokens: result.agent.usage.input_tokens,
-                        completion_tokens: result.agent.usage.output_tokens,
-                        cached_tokens: result.agent.usage.cached_input_tokens,
-                        cost_usd: result.agent.cost_usd,
-                        extra: AtifRuntimeMetrics::new(&result.agent.metadata),
-                    }),
-                    llm_call_count: Some(result.agent.model_calls),
-                    extra: Some(AtifStepExtra {
-                        terminal_event_type: "run.completed",
-                        terminal_payload: &result.agent.metadata,
-                    }),
-                },
-            ],
-            final_metrics: AtifFinalMetrics {
-                prompt_tokens: result.agent.usage.input_tokens,
-                completion_tokens: result.agent.usage.output_tokens,
-                cached_tokens: result.agent.usage.cached_input_tokens,
-                cost_usd: result.agent.cost_usd,
-                steps: 2,
-                extra: AtifFinalMetricsExtra {
-                    model_calls: result.agent.model_calls,
-                    tool_calls: result.agent.tool_calls,
-                    duration_ns: metadata_value(&result.agent.metadata, "duration_ns"),
-                    runtime: AtifRuntimeMetrics::new(&result.agent.metadata),
-                },
-            },
-        }
-    }
-}
-
-#[derive(Serialize)]
-enum AtifSchemaVersion {
-    #[serde(rename = "ATIF-v1.7")]
-    V1_7,
-}
-
-#[derive(Serialize)]
-struct AtifAgent<'a> {
-    name: &'static str,
-    version: &'static str,
-    model_name: &'a str,
-    extra: AtifAgentExtra<'a>,
-}
-
-#[derive(Serialize)]
-struct AtifAgentExtra<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    transport: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    orchestration: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct AtifStep<'a> {
-    step_id: u32,
-    source: AtifSource,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'a str>,
-    message: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<&'a [AtifToolCall]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    observation: Option<AtifObservation<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metrics: Option<AtifMetrics<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    llm_call_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    extra: Option<AtifStepExtra<'a>>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum AtifSource {
-    User,
-    Agent,
-}
-
-#[derive(Serialize)]
-struct AtifToolCall {
-    tool_call_id: String,
-    function_name: String,
-    arguments: Value,
-    extra: AtifToolCallExtra,
-}
-
-#[derive(Serialize)]
-struct AtifToolCallExtra {
-    model_call_index: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct AtifObservation<'a> {
-    results: &'a [AtifObservationResult],
-}
-
-#[derive(Serialize)]
-struct AtifObservationResult {
-    source_call_id: String,
-    content: String,
-    extra: AtifObservationExtra,
-}
-
-#[derive(Serialize)]
-struct AtifObservationExtra {
-    status: Option<String>,
-    duration_ns: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct AtifMetrics<'a> {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    cached_tokens: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cost_usd: Option<f64>,
-    extra: AtifRuntimeMetrics<'a>,
-}
-
-#[derive(Serialize)]
-struct AtifStepExtra<'a> {
-    terminal_event_type: &'static str,
-    terminal_payload: &'a Value,
-}
-
-#[derive(Serialize)]
-struct AtifFinalMetrics<'a> {
-    #[serde(rename = "total_prompt_tokens")]
-    prompt_tokens: u64,
-    #[serde(rename = "total_completion_tokens")]
-    completion_tokens: u64,
-    #[serde(rename = "total_cached_tokens")]
-    cached_tokens: u64,
-    #[serde(rename = "total_cost_usd")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cost_usd: Option<f64>,
-    #[serde(rename = "total_steps")]
-    steps: u32,
-    extra: AtifFinalMetricsExtra<'a>,
-}
-
-#[derive(Serialize)]
-struct AtifFinalMetricsExtra<'a> {
-    model_calls: u32,
-    tool_calls: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration_ns: Option<&'a Value>,
-    #[serde(flatten)]
-    runtime: AtifRuntimeMetrics<'a>,
-}
-
-#[derive(Serialize)]
-struct AtifRuntimeMetrics<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    connection_attempts: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    websocket_reconnects: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    connection_duration_ns: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_duration_ns: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warmup_duration_ns: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_work_duration_ns: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_wall_duration_ns: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warmup_usage: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_write_input_tokens: Option<&'a Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_output_tokens: Option<&'a Value>,
-}
-
-impl<'a> AtifRuntimeMetrics<'a> {
-    fn new(metadata: &'a Value) -> Self {
-        Self {
-            connection_attempts: metadata_value(metadata, "connection_attempts"),
-            websocket_reconnects: metadata_value(metadata, "websocket_reconnects"),
-            connection_duration_ns: metadata_value(metadata, "connection_duration_ns"),
-            model_duration_ns: metadata_value(metadata, "model_duration_ns"),
-            warmup_duration_ns: metadata_value(metadata, "warmup_duration_ns"),
-            tool_work_duration_ns: metadata_value(metadata, "tool_work_duration_ns"),
-            tool_wall_duration_ns: metadata_value(metadata, "tool_wall_duration_ns"),
-            warmup_usage: metadata_value(metadata, "warmup_usage"),
-            cache_write_input_tokens: metadata
-                .get("usage")
-                .and_then(|usage| usage.get("cache_write_input_tokens")),
-            reasoning_output_tokens: metadata
-                .get("usage")
-                .and_then(|usage| usage.get("reasoning_output_tokens")),
-        }
-    }
-}
-
-fn metadata_value<'a>(metadata: &'a Value, name: &str) -> Option<&'a Value> {
-    metadata.get(name)
-}
-
-fn metadata_string<'a>(metadata: &'a Value, name: &str) -> Option<&'a str> {
-    metadata.get(name).and_then(Value::as_str)
-}
-
-#[derive(Deserialize)]
-struct ReasoningSummaryPayload {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    delta: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ToolCallPayload {
-    call_id: String,
-    tool: String,
-    #[serde(default)]
-    arguments: Value,
-    #[serde(default)]
-    model_call_index: Option<u32>,
-}
-
-#[derive(Deserialize)]
-struct ToolResultPayload {
-    call_id: String,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    duration_ns: Option<u64>,
-    #[serde(default)]
-    result: Value,
-}
-
-impl ReasoningSummaryPayload {
-    fn into_text(self) -> Option<String> {
-        self.text.or(self.delta)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use nanocodex::AgentEvent;
-    use serde_json::json;
-
-    use super::HarborEventSummary;
-
-    #[test]
-    fn derives_atif_tool_calls_and_observations_from_agent_events() {
-        let call: AgentEvent = serde_json::from_value(json!({
-            "protocol_version": 1,
-            "request_id": "session",
-            "seq": 1,
-            "type": "tool.call",
-            "payload": {
-                "call_id": "call-1",
-                "tool": "apply_patch",
-                "arguments": "*** Begin Patch",
-                "model_call_index": 2
-            }
-        }))
-        .unwrap();
-        let result: AgentEvent = serde_json::from_value(json!({
-            "protocol_version": 1,
-            "request_id": "session",
-            "seq": 2,
-            "type": "tool.result",
-            "payload": {
-                "call_id": "call-1",
-                "tool": "apply_patch",
-                "status": "completed",
-                "duration_ns": 42,
-                "result": "updated"
-            }
-        }))
-        .unwrap();
-
-        let mut summary = HarborEventSummary::default();
-        summary.observe(&call).unwrap();
-        summary.observe(&result).unwrap();
-
-        assert_eq!(
-            serde_json::to_value(&summary.tool_calls).unwrap(),
-            json!([{
-                "tool_call_id": "call-1",
-                "function_name": "apply_patch",
-                "arguments": {"raw": "*** Begin Patch"},
-                "extra": {"model_call_index": 2}
-            }])
-        );
-        assert_eq!(
-            serde_json::to_value(&summary.observations).unwrap(),
-            json!([{
-                "source_call_id": "call-1",
-                "content": "\"updated\"",
-                "extra": {"status": "completed", "duration_ns": 42}
-            }])
-        );
-    }
-}

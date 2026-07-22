@@ -8,14 +8,15 @@ use crate::config::AgentArgs;
 
 #[derive(Args)]
 pub(crate) struct Eval {
-    /// Terminal-Bench task directory.
-    task: PathBuf,
+    /// Terminal-Bench task directory. Repeat for multiple evals in one job.
+    #[arg(long = "task", required = true, value_name = "DIRECTORY")]
+    tasks: Vec<PathBuf>,
 
     /// Parent directory for the retained Harbor-compatible job.
     #[arg(long, default_value = "nanoeval-runs")]
     output: PathBuf,
 
-    /// Number of fresh, independent attempts.
+    /// Number of fresh, independent attempts per task.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     trials: u16,
 
@@ -33,12 +34,21 @@ pub(crate) struct Eval {
 
 impl Eval {
     pub(crate) async fn run(self) -> Result<()> {
-        let task = Task::load(&self.task)?;
-        let (eval, _events) = Nanoeval::builder(self.agent.builder()?)
+        let trials = usize::from(self.trials);
+        let tasks = self
+            .tasks
+            .into_iter()
+            .map(Task::load)
+            .collect::<Result<Vec<_>, _>>()?;
+        let attempts = tasks
+            .into_iter()
+            .flat_map(|task| std::iter::repeat_n(task, trials));
+        let (eval, events) = Nanoeval::builder(self.agent.builder()?)
             .output_directory(self.output)
             .max_concurrency(usize::from(self.concurrency))
             .build()?;
-        let results = eval.task_n(task, usize::from(self.trials)).await?;
+        drop(events);
+        let results = eval.tasks(attempts).await?;
         if self.json {
             serde_json::to_writer_pretty(io::stdout().lock(), &results)?;
             println!();
@@ -53,5 +63,54 @@ impl Eval {
             println!("{}: {:?}", result.trial_name, result.status);
         }
         println!("Harbor job: {}", eval.output_directory().display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    use super::Eval;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        eval: Eval,
+    }
+
+    #[test]
+    fn accepts_repeated_tasks_with_per_task_trials() {
+        let cli = TestCli::try_parse_from([
+            "nanoeval",
+            "--task",
+            "tasks/first",
+            "--task",
+            "tasks/second",
+            "--trials",
+            "5",
+            "--concurrency",
+            "10",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.eval.tasks,
+            [PathBuf::from("tasks/first"), PathBuf::from("tasks/second")]
+        );
+        assert_eq!(cli.eval.trials, 5);
+        assert_eq!(cli.eval.concurrency, 10);
+    }
+
+    #[test]
+    fn requires_at_least_one_task() {
+        let Err(error) = TestCli::try_parse_from(["nanoeval"]) else {
+            panic!("a task should be required");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 }

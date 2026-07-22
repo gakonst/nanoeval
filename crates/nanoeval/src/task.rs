@@ -506,4 +506,17 @@ storage_mb = 1
         let error = Task::load(directory.path()).unwrap_err();
         assert!(error.to_string().contains("tests/test.sh"));
     }
+
+    #[test]
+    fn loads_the_native_suite_fixtures() {
+        let tasks = ["write-greeting", "uppercase-message", "extract-todos"];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tasks");
+
+        for name in tasks {
+            let task = Task::load(root.join(name)).unwrap();
+            assert_eq!(task.name(), format!("nanoeval/{name}"));
+            assert!(!task.prompt().is_empty());
+            assert!(!task.requires_compose());
+        }
+    }
 }

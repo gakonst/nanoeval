@@ -28,5 +28,9 @@ path = "src/bin/run_vm.rs"
 name = "native-task"
 path = "src/bin/native_task.rs"
 
+[[bin]]
+name = "native-suite"
+path = "src/bin/native_suite.rs"
+
 [lints]
 workspace = true

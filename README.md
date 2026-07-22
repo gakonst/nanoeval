@@ -4,6 +4,7 @@
 
 <p><strong>Blazing-fast, Docker-free, library-first evaluations for coding agents.</strong></p>
 
+[![CI](https://github.com/gakonst/nanoeval/actions/workflows/ci.yml/badge.svg)](https://github.com/gakonst/nanoeval/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)][license]
 
 **[Thesis](#why-nanoeval)** | **[Quick start](#quick-start)** | **[API](#api)** | **[Harbor](#harbor-compatible-output)** | **[Performance](#how-fast)** | **[Architecture](#architecture)**
@@ -63,16 +64,30 @@ git clone https://github.com/gakonst/nanoeval
 cd nanoeval
 
 export OPENAI_API_KEY=...
-cargo run -- run tasks/write-greeting --thinking low
+cargo run -- run --task tasks/write-greeting --thinking low
 ```
 
 The CLI prints the retained Harbor job directory. Run several independent
 attempts concurrently with:
 
 ```sh
-cargo run -- run tasks/write-greeting \
+cargo run -- run \
+  --task tasks/write-greeting \
   --trials 5 \
   --concurrency 5 \
+  --thinking low
+```
+
+Every `--task` is one eval and `--trials` applies to each one. Run the complete
+three-eval, `k=5` suite with:
+
+```sh
+cargo run -- run \
+  --task tasks/write-greeting \
+  --task tasks/uppercase-message \
+  --task tasks/extract-todos \
+  --trials 5 \
+  --concurrency 15 \
   --thinking low
 ```
 
@@ -109,6 +124,10 @@ let first = eval.task(task.clone()).await?;
 let five_fresh_attempts = eval.task_n(task, 5).await?;
 
 assert!(first.artifacts.result_json.is_file());
+assert_eq!(
+    first.trajectory.final_metrics.total_steps,
+    u32::try_from(first.trajectory.steps.len())?,
+);
 # drop(five_fresh_attempts);
 # Ok(())
 # }
@@ -117,6 +136,54 @@ assert!(first.artifacts.result_json.is_file());
 `task`, `task_n`, and `tasks` are the complete scheduling surface. Concurrency
 is ordinary Rust async concurrency bounded by the evaluator policy; it does not
 change attempt ownership or introduce a second session abstraction.
+
+### Parallel suites
+
+Run independent evals concurrently with ordinary Tokio composition. This
+launches three tasks at `k=5`; all 15 attempts may run concurrently because the
+evaluator's global limit is also 15:
+
+```rust,no_run
+# use nanocodex::{Nanocodex, Thinking};
+# use nanoeval::{Nanoeval, Task};
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+const K: usize = 5;
+let greeting = Task::load("tasks/write-greeting")?;
+let uppercase = Task::load("tasks/uppercase-message")?;
+let todos = Task::load("tasks/extract-todos")?;
+let agent = Nanocodex::builder("api-key").thinking(Thinking::Low);
+let (eval, events) = Nanoeval::builder(agent)
+    .max_concurrency(3 * K)
+    .build()?;
+drop(events);
+
+let (greeting, uppercase, todos) = tokio::try_join!(
+    eval.task_n(greeting, K),
+    eval.task_n(uppercase, K),
+    eval.task_n(todos, K),
+)?;
+
+assert_eq!(greeting.len() + uppercase.len() + todos.len(), 3 * K);
+# Ok(())
+# }
+```
+
+`max_concurrency` is the one global bound for that `Nanoeval`. Set it to `K`
+to keep at most five attempts in flight across the whole suite, or to
+`number_of_tasks * K` to allow every trial to run at once. The complete
+executable is [`examples/src/bin/native_suite.rs`](examples/src/bin/native_suite.rs).
+
+```sh
+OPENAI_API_KEY=... cargo run -p nanoeval-examples --bin native-suite
+```
+
+On an Apple M1 Max with a warm debug binary, `gpt-5.6-sol` at low effort ran
+this exact 15-attempt suite in **22.45 seconds**. All attempts began within
+41 ms, all 15 verifiers passed, and the slowest individual agent took 22.09
+seconds. The roughly 0.36-second difference is the observed scheduling,
+workspace, verification, ATIF, and Harbor-retention overhead beyond the
+critical agent path. Build time is deliberately excluded from this warm eval
+measurement.
 
 ### Lifecycle and dataflow
 
@@ -141,6 +208,10 @@ NanocodexBuilder
 
 The evaluator can be reused indefinitely. Attempts never reuse conversation
 history, tool sessions, mutable workspace state, or event sequence numbers.
+Within one attempt, Nanoeval preserves the complete agent loop: the initial
+user prompt is one ATIF step and every Nanocodex model inference is a separate
+agent step containing that turn's message, reasoning, usage, tool calls, and
+matching observations.
 
 ## Tasks
 
@@ -156,8 +227,9 @@ task/
 ```
 
 The prompt and verifier are canonical inputs. Nanoeval does not rewrite either
-to improve an agent's score. The included `write-greeting` task is a minimal
-end-to-end fixture, not a substitute for the full benchmark.
+to improve an agent's score. The included `write-greeting`,
+`uppercase-message`, and `extract-todos` tasks are minimal end-to-end fixtures,
+not substitutes for the full benchmark.
 
 Native mode copies `environment/` into a disposable workspace and executes the
 agent and verifier there. It rejects custom Compose environments and should be
@@ -198,9 +270,12 @@ harbor view nanoeval-runs --jobs
 
 The current output validates with Harbor's own `JobConfig`, `JobLock`,
 `JobResult`, `TrialConfig`, `TrialLock`, `TrialResult`, and ATIF-v1.7
-`Trajectory` models. ATIF includes ordered tool calls and matching
-observations. Nanoeval also matches Harbor's Python `dirhash` task checksum and
-Packager content digest, so result and lock identity agree with Harbor.
+`Trajectory` models. The typed `EvalResult` owns that `AtifTrajectory`; Harbor
+only serializes the completed result. ATIF is accumulated directly from the
+ordered Nanocodex event stream, with one step per model turn and same-step tool
+calls and observations. Nanoeval also matches Harbor's Python `dirhash` task
+checksum and Packager content digest, so result and lock identity agree with
+Harbor.
 
 Harbor remains an output and inspection boundary; its Python runtime and Docker
 executor are not dependencies of an attempt.
@@ -291,6 +366,7 @@ Runnable library consumers:
 ```sh
 cargo run -p nanoeval-examples --bin load-task -- tasks/write-greeting
 cargo run -p nanoeval-examples --bin native-task -- tasks/write-greeting
+cargo run -p nanoeval-examples --bin native-suite
 cargo run -p nanoeval-examples --bin run-vm -- /path/to/rootfs /bin/uname -a
 ```
 

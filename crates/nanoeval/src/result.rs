@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uuid::Uuid;
+
+use crate::AtifTrajectory;
 
 /// Terminal score classification for one attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -21,6 +22,7 @@ pub struct EvalResult {
     pub trial_name: String,
     pub status: EvalStatus,
     pub agent: AgentResult,
+    pub trajectory: AtifTrajectory,
     pub verifier: VerifierResult,
     pub timing: EvalTiming,
     pub artifacts: EvalArtifacts,
@@ -35,7 +37,47 @@ pub struct AgentResult {
     pub tool_calls: u32,
     pub usage: UsageTotals,
     pub cost_usd: Option<f64>,
-    pub metadata: Value,
+    pub metadata: AgentMetadata,
+}
+
+/// Typed metadata emitted by Nanocodex's terminal event.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AgentMetadata {
+    pub status: AgentStatus,
+    pub model: String,
+    pub effort: String,
+    pub transport: String,
+    pub orchestration: String,
+    pub duration_ms: u64,
+    pub duration_ns: u64,
+    pub model_calls: u32,
+    pub steers: u32,
+    pub compactions: u32,
+    pub tool_calls: u32,
+    pub connection_attempts: u32,
+    pub websocket_reconnects: u32,
+    pub response_attempts: u32,
+    pub response_retries: u32,
+    pub connection_duration_ns: u64,
+    pub retry_backoff_duration_ns: u64,
+    pub model_duration_ns: u64,
+    pub warmup_duration_ns: u64,
+    pub tool_work_duration_ns: u64,
+    pub tool_wall_duration_ns: u64,
+    pub usage: UsageTotals,
+    pub warmup_usage: UsageTotals,
+    #[serde(default, rename = "last_response_id", skip_serializing)]
+    _last_response_id: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub cost_status: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

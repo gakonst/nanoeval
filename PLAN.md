@@ -6,8 +6,13 @@ runs a canonical verifier, multiplexes typed events, and retains
 Harbor-compatible job/trial/ATIF output. The simple `write-greeting` fixture has
 passed live; its configs, locks, results, and ATIF validate with Harbor's own
 models, and `harbor view` reads the job, trial, trajectory, verifier, and file
-endpoints directly. The minimal
-libkrun bring-up remains separate from the attempt runner.
+endpoints directly. ATIF is now a typed field on `EvalResult` and is folded
+from the live event stream with one step per model turn rather than a lossy
+two-step summary. The native concurrency milestone is also complete: the public
+library example ran three tasks at `k=5` as 15 concurrent attempts, passed all
+15 verifiers, and retained a Harbor-valid 15-trial job in 22.45 seconds from a
+warm binary. The minimal libkrun bring-up remains separate from the attempt
+runner.
 
 ## Library boundaries
 
