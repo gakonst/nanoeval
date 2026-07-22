@@ -46,10 +46,10 @@ impl Eval {
             .into_iter()
             .flat_map(|task| std::iter::repeat_n(task, trials));
         let (eval, events) = Nanoeval::builder(self.agent.builder()?)
-            .run_directory(self.output)
+            .output_directory(self.output)
             .max_concurrency(usize::from(self.concurrency))
             .build()?;
-        let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
+        let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
         let progress = tokio::spawn(report_progress(events.subscribe(), attempt_count));
         let results = eval.tasks(attempts).await?;
         let job = harbor.finish(results.clone()).await?;

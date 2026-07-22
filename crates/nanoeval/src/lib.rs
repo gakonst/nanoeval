@@ -1,9 +1,9 @@
 mod atif;
 mod evaluator;
 mod event;
+mod job;
 mod native;
 mod result;
-mod run;
 mod task;
 
 pub use atif::{
@@ -20,5 +20,4 @@ pub use result::{
     AgentMetadata, AgentResult, AgentStatus, EvalArtifacts, EvalResult, EvalStatus, EvalTiming,
     PhaseTiming, UsageTotals, VerifierResult,
 };
-pub use run::EvalRun;
 pub use task::{NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier};

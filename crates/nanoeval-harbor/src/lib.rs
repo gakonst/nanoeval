@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use nanoeval::{
     AgentMetadata, AtifBuilder, AtifTrajectory, EvalEventKind, EvalEventStreamError, EvalResult,
-    EvalRun, NanoevalEventStream, PhaseTiming, Task,
+    Nanoeval, NanoevalEventStream, PhaseTiming, Task,
 };
 use serde::Serialize;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -63,7 +63,7 @@ pub enum HarborError {
     Runtime(#[from] tokio::runtime::TryCurrentError),
 }
 
-/// Explicit Harbor compatibility adapter for one Nanoeval run.
+/// Explicit Harbor compatibility adapter for one evaluation job.
 pub struct Harbor {
     artifacts: HarborArtifacts,
 }
@@ -81,15 +81,15 @@ pub struct HarborJob {
 }
 
 impl Harbor {
-    /// Attaches the adapter to an existing native Nanoeval run directory.
+    /// Attaches the adapter to a reusable evaluator and its artifact directory.
     ///
     /// # Errors
     ///
-    /// Returns an error when the run directory cannot be initialized with
+    /// Returns an error when the evaluator directory cannot be initialized with
     /// Harbor job metadata.
-    pub fn new(run: &EvalRun) -> Result<Self, HarborError> {
+    pub fn new(eval: &Nanoeval) -> Result<Self, HarborError> {
         Ok(Self {
-            artifacts: HarborArtifacts::attach(run)?,
+            artifacts: HarborArtifacts::attach(eval)?,
         })
     }
 
@@ -241,13 +241,13 @@ struct HarborArtifacts {
 }
 
 impl HarborArtifacts {
-    fn attach(run: &EvalRun) -> Result<Self, HarborError> {
+    fn attach(eval: &Nanoeval) -> Result<Self, HarborError> {
         let artifacts = Self {
-            job_id: run.id(),
-            started_at: run.started_at(),
-            root: run.directory().to_path_buf(),
-            jobs_dir: run.parent_directory().to_path_buf(),
-            max_concurrency: run.max_concurrency(),
+            job_id: eval.id(),
+            started_at: eval.started_at(),
+            root: eval.directory().to_path_buf(),
+            jobs_dir: eval.parent_directory().to_path_buf(),
+            max_concurrency: eval.max_concurrency(),
             recorded_trials: Mutex::new(Vec::new()),
         };
         Self::write_file(&artifacts.root.join("job.log"), [])?;

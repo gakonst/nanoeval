@@ -10,8 +10,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalResult, EvalRun,
-    EvalStatus, EvalTiming, NanoevalEvents, PhaseTiming, Task, native::NativeAttempt,
+    AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalResult, EvalStatus,
+    EvalTiming, NanoevalEvents, PhaseTiming, Task, job::EvalJob, native::NativeAttempt,
 };
 
 const EVENT_CAPACITY: usize = 16_384;
@@ -26,13 +26,13 @@ pub struct Nanoeval {
 /// Deliberate evaluator policy configured before running tasks.
 pub struct NanoevalBuilder {
     nanocodex: NanocodexBuilder<StandardResponses>,
-    run_directory: PathBuf,
+    output_directory: PathBuf,
     max_concurrency: usize,
 }
 
 struct NanoevalInner {
     nanocodex: NanocodexBuilder<StandardResponses>,
-    run: EvalRun,
+    job: EvalJob,
     concurrency: Arc<Semaphore>,
     max_concurrency: usize,
     events: broadcast::Sender<Arc<EvalEvent>>,
@@ -79,7 +79,7 @@ impl Nanoeval {
     pub fn builder(nanocodex: NanocodexBuilder<StandardResponses>) -> NanoevalBuilder {
         NanoevalBuilder {
             nanocodex,
-            run_directory: PathBuf::from("nanoeval-runs"),
+            output_directory: PathBuf::from("nanoeval-runs"),
             max_concurrency: 1,
         }
     }
@@ -129,16 +129,41 @@ impl Nanoeval {
         Ok(results.into_iter().map(|(_, result)| result).collect())
     }
 
+    /// Returns the stable identifier shared by this evaluator's attempts.
     #[must_use]
-    pub fn run(&self) -> &EvalRun {
-        &self.inner.run
+    pub fn id(&self) -> Uuid {
+        self.inner.job.id()
+    }
+
+    /// Returns when this evaluator was built.
+    #[must_use]
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.inner.job.started_at()
+    }
+
+    /// Returns the directory containing this evaluator's attempt artifacts.
+    #[must_use]
+    pub fn directory(&self) -> &std::path::Path {
+        self.inner.job.directory()
+    }
+
+    /// Returns the parent directory containing evaluation jobs.
+    #[must_use]
+    pub fn parent_directory(&self) -> &std::path::Path {
+        self.inner.job.parent_directory()
+    }
+
+    /// Returns the maximum number of concurrently executing attempts.
+    #[must_use]
+    pub fn max_concurrency(&self) -> usize {
+        self.inner.max_concurrency
     }
 
     async fn run_task(&self, task: Task) -> Result<EvalResult, EvalError> {
         let started_at = Utc::now();
         let attempt_id = Uuid::new_v4();
         let trial_name = trial_name(&task, attempt_id);
-        let attempt = NativeAttempt::prepare(self.inner.run.directory(), &trial_name, &task)?;
+        let attempt = NativeAttempt::prepare(self.inner.job.directory(), &trial_name, &task)?;
         let mut emitter = AttemptEmitter::new(self, attempt_id, &task, &trial_name);
         emitter.emit(EvalEventKind::AttemptStarted {
             prompt: task.prompt().to_owned(),
@@ -237,10 +262,10 @@ struct AgentExecution {
 
 impl NanoevalBuilder {
     /// Sets the parent under which this evaluator creates one UUID-named
-    /// native run directory.
+    /// artifact directory.
     #[must_use]
-    pub fn run_directory(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.run_directory = directory.into();
+    pub fn output_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.output_directory = directory.into();
         self
     }
 
@@ -259,13 +284,13 @@ impl NanoevalBuilder {
         if self.max_concurrency == 0 {
             return Err(EvalError::InvalidConcurrency);
         }
-        let run = EvalRun::create(&self.run_directory, self.max_concurrency)?;
+        let job = EvalJob::create(&self.output_directory)?;
         let (event_sender, _) = broadcast::channel(EVENT_CAPACITY);
         Ok((
             Nanoeval {
                 inner: Arc::new(NanoevalInner {
                     nanocodex: self.nanocodex,
-                    run,
+                    job,
                     concurrency: Arc::new(Semaphore::new(self.max_concurrency)),
                     max_concurrency: self.max_concurrency,
                     events: event_sender.clone(),
@@ -298,7 +323,7 @@ impl<'a> AttemptEmitter<'a> {
     fn emit(&mut self, kind: EvalEventKind) {
         self.sequence += 1;
         let _ = self.eval.inner.events.send(Arc::new(EvalEvent {
-            run_id: self.eval.inner.run.id(),
+            run_id: self.eval.inner.job.id(),
             attempt_id: self.attempt_id,
             task_name: self.task_name.clone(),
             trial_name: self.trial_name.clone(),

@@ -14,10 +14,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_or_else(|| PathBuf::from("nanoeval-runs"), PathBuf::from);
     let task = Task::load(task_directory)?;
     let (eval, events) = Nanoeval::builder(Nanocodex::builder(auth()?))
-        .run_directory(output_directory)
+        .output_directory(output_directory)
         .build()?;
 
-    let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
+    let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
     let mut event_stream = events.subscribe();
     let observer_task = tokio::spawn(async move {
         let mut count = 0_u64;

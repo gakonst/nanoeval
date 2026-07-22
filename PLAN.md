@@ -24,7 +24,7 @@ The repository follows the same library-first layout as Nanocodex:
   libkrun/KVM/HVF lifecycle, the future VMM process protocol, execution, and
   pause/resume;
 - `nanoeval` owns evaluation: task loading, preparation, attempts, verification,
-  native run state, typed event subscriptions, and scheduling;
+  native job state, typed event subscriptions, and scheduling;
 - `nanoeval-harbor` owns the explicit streaming Harbor and ATIF projection;
 - `bin/nanoeval` is a thin CLI over those libraries; and
 - `examples` compiles the intended public consumption paths.

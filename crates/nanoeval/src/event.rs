@@ -31,13 +31,13 @@ pub enum EvalEventKind {
     Completed(Box<EvalResult>),
 }
 
-/// Cloneable source of independent subscriptions to one Nanoeval run.
+/// Cloneable source of independent subscriptions to one evaluation job.
 #[derive(Clone)]
 pub struct NanoevalEvents {
     sender: broadcast::Sender<Arc<EvalEvent>>,
 }
 
-/// One independent, ordered subscription to a Nanoeval run.
+/// One independent, ordered subscription to an evaluation job.
 pub struct NanoevalEventStream {
     receiver: broadcast::Receiver<Arc<EvalEvent>>,
 }

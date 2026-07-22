@@ -22,10 +22,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (first, second, third) = (first?, second?, third?);
     let agent = Nanocodex::builder(auth()?).thinking(Thinking::Low);
     let (eval, events) = Nanoeval::builder(agent)
-        .run_directory(output_directory)
+        .output_directory(output_directory)
         .max_concurrency(TASKS.len() * K)
         .build()?;
-    let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
+    let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
     let observer = tokio::spawn(observe(events.subscribe(), TASKS.len() * K));
 
     let (first, second, third) = tokio::try_join!(

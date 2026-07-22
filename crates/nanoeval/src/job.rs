@@ -8,21 +8,17 @@ use uuid::Uuid;
 
 use crate::EvalError;
 
-/// Stable metadata and native storage for one reusable evaluation run.
+/// Stable metadata and native storage for one reusable evaluator.
 #[derive(Clone, Debug)]
-pub struct EvalRun {
+pub(crate) struct EvalJob {
     id: Uuid,
     started_at: DateTime<Utc>,
     directory: PathBuf,
     parent_directory: PathBuf,
-    max_concurrency: usize,
 }
 
-impl EvalRun {
-    pub(crate) fn create(
-        parent_directory: &Path,
-        max_concurrency: usize,
-    ) -> Result<Self, EvalError> {
+impl EvalJob {
+    pub(crate) fn create(parent_directory: &Path) -> Result<Self, EvalError> {
         fs::create_dir_all(parent_directory)?;
         let parent_directory = fs::canonicalize(parent_directory)?;
         let id = Uuid::new_v4();
@@ -33,7 +29,6 @@ impl EvalRun {
             started_at: Utc::now(),
             directory,
             parent_directory,
-            max_concurrency,
         })
     }
 
@@ -55,10 +50,5 @@ impl EvalRun {
     #[must_use]
     pub fn parent_directory(&self) -> &Path {
         &self.parent_directory
-    }
-
-    #[must_use]
-    pub const fn max_concurrency(&self) -> usize {
-        self.max_concurrency
     }
 }

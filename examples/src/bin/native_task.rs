@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_or_else(|| PathBuf::from("nanoeval-native-runs"), PathBuf::from);
     let task = Task::load(task_directory)?;
     let (eval, events) = Nanoeval::builder(Nanocodex::builder(auth()?))
-        .run_directory(output_directory)
+        .output_directory(output_directory)
         .build()?;
     let mut event_stream = events.subscribe();
     let observer_task = tokio::spawn(async move {
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let event_count = observer_task.await??;
     println!("{}: {:?}", result.trial_name, result.status);
     println!("Observed {event_count} typed events");
-    println!("Native run: {}", eval.run().directory().display());
+    println!("Native evaluation: {}", eval.directory().display());
     Ok(())
 }
 

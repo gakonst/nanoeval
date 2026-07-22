@@ -109,7 +109,7 @@ use nanoeval::{EvalEventKind, EvalEventStreamError, Nanoeval, Task};
 let task = Task::load("tasks/write-greeting")?;
 
 let (eval, events) = Nanoeval::builder(Nanocodex::builder("api-key"))
-    .run_directory("nanoeval-native-runs")
+    .output_directory("nanoeval-native-runs")
     .max_concurrency(5)
     .build()?;
 
@@ -152,11 +152,11 @@ another subscription concurrently without competing with Harbor:
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let task = Task::load("tasks/write-greeting")?;
 let (eval, events) = Nanoeval::builder(Nanocodex::builder("api-key"))
-    .run_directory("nanoeval-runs")
+    .output_directory("nanoeval-runs")
     .build()?;
 
 // Both subscriptions exist before the first attempt emits anything.
-let harbor = Harbor::new(eval.run())?.record(events.subscribe())?;
+let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
 let mut application_events = events.subscribe();
 let application = tokio::spawn(async move {
     let mut observed = 0_u64;
@@ -184,9 +184,9 @@ println!("Harbor job: {}", job.directory().display());
 # }
 ```
 
-`run_directory("nanoeval-runs")` selects the jobs parent. `build()` creates one
-UUID-named native run beneath it, and `Harbor::new(eval.run())` explicitly
-attaches Harbor output to that run. `record(...)` starts draining immediately;
+`output_directory("nanoeval-runs")` selects the jobs parent. `build()` creates one
+UUID-named evaluation job beneath it, and `Harbor::new(&eval)` explicitly
+attaches Harbor output to that evaluator. `record(...)` starts draining immediately;
 `finish(...)` is finalization, not deferred event conversion.
 
 See [`examples/src/bin/harbor_task.rs`](examples/src/bin/harbor_task.rs):
@@ -217,7 +217,7 @@ let agent = Nanocodex::builder("api-key").thinking(Thinking::Low);
 let (eval, events) = Nanoeval::builder(agent)
     .max_concurrency(3 * K)
     .build()?;
-let harbor = nanoeval_harbor::Harbor::new(eval.run())?
+let harbor = nanoeval_harbor::Harbor::new(&eval)?
     .record(events.subscribe())?;
 
 let (greeting, uppercase, todos) = tokio::try_join!(
@@ -376,7 +376,7 @@ The repository follows the same library-first split as Nanocodex:
 
 | Crate | Responsibility |
 | --- | --- |
-| `nanoeval` | Tasks, attempts, verification, scheduling, native run state, and typed event subscriptions |
+| `nanoeval` | Tasks, attempts, verification, scheduling, native job state, and typed event subscriptions |
 | `nanoeval-harbor` | Streaming Harbor job/trial persistence and ATIF projection |
 | `nanovm` | libkrun configuration, host capabilities, guest commands, and the low-level VMM lifecycle |
 | `nanoeval-bin` | Thin CLI over the libraries |
