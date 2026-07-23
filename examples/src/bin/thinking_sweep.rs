@@ -1,7 +1,7 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Nanocodex, OpenAiAuth, Thinking};
-use nanoeval::{AgentVariant, AgentVariantSpec, EvalPlan, Nanoeval, PlannedTask, Task, TrialCount};
+use nanoeval::{Nanoeval, Sweep, Task};
 
 const K: u16 = 5;
 type AnyError = Box<dyn Error + Send + Sync>;
@@ -14,44 +14,28 @@ async fn main() -> Result<(), AnyError> {
             .map_or_else(|| PathBuf::from("tasks/write-greeting"), PathBuf::from),
     )?;
     let auth = auth()?;
-    let plan = EvalPlan::builder()
-        .task(task, TrialCount::new(K)?)
-        .variant(AgentVariant::new(
-            AgentVariantSpec::new("thinking-low", Thinking::Low, "defaults")?,
-            Nanocodex::builder(auth.clone()),
-        ))
-        .variant(AgentVariant::new(
-            AgentVariantSpec::new("thinking-high", Thinking::High, "defaults")?,
-            Nanocodex::builder(auth),
-        ))
+    let nanocodex = Nanocodex::builder(auth);
+    let sweep = Sweep::builder()
+        .task(task)
+        .trials(K)
+        .agent("thinking-low", nanocodex.clone().thinking(Thinking::Low))?
+        .agent("thinking-high", nanocodex.clone().thinking(Thinking::High))?
         .build()?;
 
-    println!("planned {} independent attempts", plan.attempt_count());
-    let mut executions = tokio::task::JoinSet::new();
-    for variant in plan.variants().iter().cloned() {
-        executions.spawn(run_variant(variant, plan.tasks().to_vec()));
-    }
-    while let Some(execution) = executions.join_next().await {
-        execution??;
-    }
-    Ok(())
-}
-
-async fn run_variant(variant: AgentVariant, tasks: Vec<PlannedTask>) -> Result<(), AnyError> {
-    let output = PathBuf::from("nanoeval-sweep-runs").join(variant.spec().id().as_str());
-    let (eval, _events) = Nanoeval::builder(variant.nanocodex().clone())
-        .output_directory(output)
-        .max_concurrency(usize::from(K))
+    println!("planned {} independent attempts", sweep.attempt_count());
+    let (eval, _events) = Nanoeval::builder(nanocodex)
+        .output_directory("nanoeval-sweep-runs/thinking")
+        .max_concurrency(sweep.attempt_count())
         .build()?;
-    let attempts = tasks
-        .into_iter()
-        .flat_map(|task| std::iter::repeat_n(task.task().clone(), usize::from(task.trials())));
-    let results = eval.tasks(attempts).await?;
-    println!(
-        "{}: {} completed attempts",
-        variant.spec().id(),
-        results.len()
-    );
+    let results = eval.sweep(sweep).await?;
+    for agent in ["thinking-low", "thinking-high"] {
+        let completed = results
+            .attempts()
+            .iter()
+            .filter(|attempt| attempt.agent().as_str() == agent)
+            .count();
+        println!("{agent}: {completed} completed attempts");
+    }
     Ok(())
 }
 

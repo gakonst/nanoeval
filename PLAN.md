@@ -17,7 +17,65 @@ warm binary. The VM-backed version also passes all 15 trials with one retained
 VM and Nanocodex session per attempt, 15 concurrent VMs, Harbor-compatible
 output, and 21.10 seconds end to end. Agent/VMM setup averaged 63.9 ms. This
 proof uses copied trusted rootfs directories and writable virtiofs; it is not
-yet the scored isolation design.
+yet the scored isolation design. Nanoeval and `nanocodex-vm` now emit
+Nanocodex-style bounded tracing spans for attempt roots, environment/agent/
+verifier phases, rootfs materialization, VMM process spawn, and typed VM tool
+RPCs. The CLI reuses `nanocodex-observability` for local JSON and OTLP export,
+so the next placement and pooling decisions can be made from representative
+end-to-end traces rather than aggregate wall time alone.
+The first canonical Terminal-Bench 2.1 VM slice is now complete for
+`count-dataset-tokens`: Nanoeval resolved `python:3.13-slim-bookworm` as
+Linux/ARM64 through the OCI Distribution API, applied its layers directly into
+a sparse ext4 disk, cloned that disk with APFS CoW, attached the current static
+guest runtime through a narrow protected share, ran all Nanocodex workspace
+tools in the guest, then uploaded and ran the unmodified verifier in the same
+retained guest. No Docker-compatible
+runtime or Rosetta was involved. The one low-thinking attempt produced `79586`,
+passed the canonical pytest verifier with reward `1`, and retained the CoW
+disk, answer, CTRF, full trace, ATIF trajectory, and Harbor-shaped result. A
+second July 22 proof passed in 83.55 seconds at the CLI and retained 82.12
+seconds: 76.61 seconds of agent execution, 5.49 seconds of in-guest
+verification, 0.38 ms of environment setup, and 1.88 ms of agent/VMM setup.
+The variance is in model and guest command work, not Nanoeval setup. The OCI
+cache now separates exact reference resolution, manifest-keyed flattened ext4
+images, task `WORKDIR`, and the guest tool runtime. Warm local image resolution
+is 0.03--0.04 seconds in the built binary and fresh VM boot plus the first typed
+command is 0.16--0.22 seconds. A typed runtime build record avoids re-hashing
+the unchanged guest binary, while the macOS Cargo runner uses content-addressed
+signed executables so Cargo cannot silently replace the VMM child with an unsigned
+artifact. This is intentionally one proof task, not authorization to fan out
+across the suite.
+Every attempt still receives a unique Nanocodex session and checkpoint lineage,
+while bounded three-attempt cohorts supply shared prompt-cache keys and
+singleflight one warmup per exact agent prefix. Later attempts skip that separate
+8k-token request and begin with an independent complete generation using their
+cohort's cache key. Bounding the cohort avoids turning a whole eval job into one
+provider-routing hot key.
+The default API remains `task`, `task_n`, `tasks(Vec<Task>)`, and
+`tasks_n(Vec<Task>, k)`. Advanced task-by-agent-by-trial comparison is explicit
+through `Sweep`; scheduler coordinates and the typed `run.json` manifest stay
+private. The CLI uses a one-agent sweep internally so all trials share one
+Nanoeval/Harbor job and one concurrency bound. Before execution, Nanoeval
+atomically binds the job to canonical task roots, trial count, and stable agent
+IDs while excluding credentials and opaque builders.
+Automatic VM preparation now has the same multi-task shape: one invocation
+prepares every distinct canonical task environment, and each attempt selects
+its own root disk, workdir, image environment, and detected shell. The separate
+`vm prepare` command accepts repeated `--task` arguments and prepares the guest
+runtime once for the batch. A warm three-environment preparation took 1.03
+seconds; the first three-task, concurrency-three VM job passed all three
+verifiers in 39.67 seconds.
+The CLI now emits one run-level timing record separating task loading, guest
+runtime preparation, task environment preparation, evaluator setup, concurrent
+attempt wall time, Harbor finalization, output, and total in-process wall time,
+along with aggregate model/warmup/tool/verifier work. `vm prepare` reports the
+same cache hit/create counts and per-task durations without starting an agent.
+After a host-only evaluator edit, the guest runtime remained a hit at 3.45 ms
+and the task root remained a hit at 18.69 ms; the successful retained attempt
+spent 28.60 of 29.84 seconds in the model, 9.69 ms in guest tool work, 285.86 ms
+in its fresh verifier guest, and 4.17 ms finalizing Harbor output. A fully warm
+three-task preparation took 23 ms in process and 0.03 seconds through the built
+binary. Cargo/link/sign remains an explicitly separate developer-loop metric.
 
 ## Library boundaries
 
@@ -308,7 +366,7 @@ resources idle or causes contention.
 
 ## Durable finite jobs
 
-Automatic completion and restart are defined only for a finite `EvalPlan`.
+Automatic completion and restart are defined only for a finite run or `Sweep`.
 The existing reusable `eval.task(...)` and `eval.task_n(...)` calls remain
 useful ad hoc operations, but an open-ended library object cannot infer when a
 caller has finished adding work and therefore cannot seal itself automatically.
@@ -316,31 +374,31 @@ caller has finished adding work and therefore cannot seal itself automatically.
 The durable CLI contract will be:
 
 ```text
-nanoeval run ...    resume the matching active plan, or create and execute it
-nanoeval run        resume the retained active plan after interruption
-nanoeval start ...  require no active job, then create and execute a fresh plan
+nanoeval run ...    resume the matching active run, or create and execute it
+nanoeval run        resume the retained active run after interruption
+nanoeval start ...  require no active job, then create and execute a fresh run
 nanoeval end        request cancellation and seal the active job as stopped
 nanoeval status     inspect the active job without mutating it
 ```
 
 One atomic active-job pointer exists per output directory. A job retains an
-immutable plan, an atomic state snapshot, and an append-only typed transition
-journal. The stable trial slot is task identity × agent variant identity ×
-one-based ordinal. Each execution of that slot has a fresh execution ID,
+immutable private run manifest, an atomic state snapshot, and an append-only
+typed transition journal. The private attempt key is task identity × agent
+identity × one-based trial number. Each execution of that key has a fresh execution ID,
 Nanocodex session, tool runtime, event sequence, and workspace.
 
-After Ctrl-C, completed slots remain committed and incomplete slots are
-interrupted. The next `run` skips completed slots and starts fresh executions
+After Ctrl-C, completed attempts remain committed and incomplete attempts are
+interrupted. The next `run` skips completed attempts and starts fresh executions
 for incomplete slots; it never resumes an interrupted conversation or dirty
 workspace. A live executor lease prevents two CLI processes from executing the
 same job concurrently. `end` prevents new claims, cancels live work, waits for
 cleanup, and preserves every completed result.
 
 Native state is authoritative. Events are durably appended before live fanout,
-and Harbor must be rebuildable from the retained plan, journal, and typed
+and Harbor must be rebuildable from the retained manifest, journal, and typed
 results rather than owning the only copy of them. Thinking and tool sweeps use
 caller-defined stable variant and tool-profile IDs so resume can reject a
-changed plan without attempting to hash opaque builder closures.
+changed run configuration without attempting to hash opaque builder closures.
 
 ## Measurement model
 
@@ -408,11 +466,20 @@ measured complexity, fault containment, and performance.
 
 ### 3. Docker-free OCI materializer
 
-- Pull one simple task image directly by digest.
-- Apply layers into ext4 and prove filesystem metadata against an independent
+- [x] Pull one simple ARM64 base image directly through OCI Distribution.
+- [x] Apply layers into a sparse ext4 disk, retain opaque layer ordering and
+  OCI whiteout behavior, and cache by manifest, platform, converter, and
+  disk-size identity while retaining `WORKDIR` as separate task metadata.
+- [x] Cache the local tag-to-manifest resolution separately and keep the OCI
+  task disk independent from the current VM tool runtime, which is attached as
+  a narrow read-only libkrun share per attempt.
+- [ ] Prove filesystem metadata against an independent
   OCI reference extraction.
-- Cache by complete content and converter digest.
-- Expand to the full architecture and image inventory.
+- [x] Implement the complete Dockerfile instruction inventory observed across
+  all 89 tasks: multi-stage `FROM`, `RUN`, `COPY`/`COPY --from`, `WORKDIR`,
+  `ENV`, `ARG`, and `CMD`; prove ordinary RUN/COPY, shell-only Alpine, ENV
+  propagation, and the suite's unique multi-stage COPY edge.
+- [ ] Cold-build all 89 tasks and classify runtime/kernel incompatibilities.
 
 Gate: no Docker-compatible runtime is invoked, and repeated preparation of an
 unchanged task is a cache hit.
@@ -433,10 +500,12 @@ the harness credential or authoritative journal.
 
 ### 5. One canonical Terminal-Bench task
 
-- Materialize an image directly from its pinned OCI digest.
-- Execute the unmodified task instruction and verifier.
-- Reconcile filesystem outcome, verifier output, trajectory, reward, usage, and
+- [x] Rebuild one amd64-only task's trivial Dockerfile from its pinned ARM64
+  base image without emulation.
+- [x] Execute the unmodified task instruction and verifier in one retained VM.
+- [x] Reconcile filesystem outcome, verifier output, trajectory, reward, usage, and
   timing with Harbor.
+- [ ] Repeat only this task against the Harbor baseline before widening scope.
 
 Gate: repeated Nanoeval and Harbor trials show equivalent environment and result
 semantics before any full benchmark run.
@@ -488,18 +557,25 @@ artifact divergence.
 
 ## Immediate next experiment
 
-Do not build the full runner yet. Continue two narrow tracks:
+Do not scale beyond the proven task yet:
 
-1. make the finite `EvalPlan` the durable native execution source of truth and
-   implement `run` resume, `start`, `end`, and stale-executor recovery;
-2. turn the one-shot guest command into a tiny, long-lived guest supervisor
-   reachable over a libkrun console or vsock channel;
-3. connect its concrete client to the existing `nanocodex-vm` proxies and
-   measure 100 in-guest process launches, streamed output, cancellation, and
-   cleanup without rebooting the VM; and
-4. inventory every pinned Terminal-Bench 2.1 OCI manifest architecture before
-   building the image materializer.
-
-Those results decide whether one warm libkrun VM should multiplex attempts or
-whether fast one-VM-per-attempt execution is already the simpler throughput
-winner.
+1. [x] add an explicit guest shutdown/flush control operation and boot the
+   verifier as a fresh VMM child from the complete mutated disk;
+2. [x] add a content-addressed post-agent apt/uv cache, strict readiness checks,
+   runtime DNS injection, and a separate CoW verifier disk; `regex-log` passed
+   from `ubuntu:24.04` and improved from 18.187 seconds cold to 11.505 seconds
+   warm without exposing curl to the agent disk;
+3. [x] replace writable verifier virtiofs shares with a content-addressed CoW
+   ext4 dependency disk and start recognized warm scripts after their cached
+   bootstrap; `regex-log` verification fell from 7.695 seconds to 0.960 seconds
+   with the same reward and CTRF result;
+4. make the official `libkrunfw` acquisition/build an explicit cached prepare
+   dependency so a clean checkout does not rely on a manually populated dylib;
+5. independently compare the prepared ext4 metadata and image config with an
+   OCI reference extraction;
+6. make verifier timeout terminate its complete guest process group and export
+   a general workspace artifact archive instead of the proof task's answer file;
+7. rerun only `count-dataset-tokens` against a pinned Harbor baseline and
+   reconcile every result/trajectory/verifier field; and
+8. cold-build the 89-task inventory only after the single-task Harbor parity
+   gate, then select the next runtime/kernel compatibility slice.

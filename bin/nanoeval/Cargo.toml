@@ -11,18 +11,29 @@ repository.workspace = true
 description = "CLI consumer for Nanoeval and NanoVM"
 
 [dependencies]
+arcbox-ext4.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
+flate2.workspace = true
+ignore.workspace = true
 nanocodex.workspace = true
+nanocodex-observability.workspace = true
 nanocodex-vm.workspace = true
 nanoeval.workspace = true
 nanoeval-harbor.workspace = true
 nanovm.workspace = true
+oci-client.workspace = true
+reflink-copy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+zstd.workspace = true
 
 [[bin]]
 name = "nanoeval"

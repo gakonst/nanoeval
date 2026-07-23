@@ -1,7 +1,7 @@
 use std::{env, error::Error, path::PathBuf};
 
 use nanocodex::{Mcp, McpServer, Nanocodex, OpenAiAuth, Thinking, Tools};
-use nanoeval::{AgentVariant, AgentVariantSpec, EvalPlan, Nanoeval, PlannedTask, Task, TrialCount};
+use nanoeval::{Nanoeval, Sweep, Task};
 
 const K: u16 = 5;
 type AnyError = Box<dyn Error + Send + Sync>;
@@ -14,6 +14,7 @@ async fn main() -> Result<(), AnyError> {
             .map_or_else(|| PathBuf::from("tasks/write-greeting"), PathBuf::from),
     )?;
     let auth = auth()?;
+    let nanocodex = Nanocodex::builder(auth);
     let default_tools = Tools::builder().build()?;
     let docs = Mcp::builder()
         .server(
@@ -27,45 +28,39 @@ async fn main() -> Result<(), AnyError> {
         .into_builder()
         .provider(docs)
         .build()?;
-    let plan = EvalPlan::builder()
-        .task(task, TrialCount::new(K)?)
-        .variant(AgentVariant::new(
-            AgentVariantSpec::new("without-mcp", Thinking::Low, "defaults")?,
-            Nanocodex::builder(auth.clone()).tools(default_tools),
-        ))
-        .variant(AgentVariant::new(
-            AgentVariantSpec::new("with-docs-mcp", Thinking::Low, "defaults-plus-docs-mcp")?,
-            Nanocodex::builder(auth).tools(tools_with_mcp),
-        ))
+    let sweep = Sweep::builder()
+        .task(task)
+        .trials(K)
+        .agent(
+            "without-mcp",
+            nanocodex
+                .clone()
+                .thinking(Thinking::Low)
+                .tools(default_tools),
+        )?
+        .agent(
+            "with-docs-mcp",
+            nanocodex
+                .clone()
+                .thinking(Thinking::Low)
+                .tools(tools_with_mcp),
+        )?
         .build()?;
 
-    println!("planned {} independent attempts", plan.attempt_count());
-    let mut executions = tokio::task::JoinSet::new();
-    for variant in plan.variants().iter().cloned() {
-        executions.spawn(run_variant(variant, plan.tasks().to_vec()));
-    }
-    while let Some(execution) = executions.join_next().await {
-        execution??;
-    }
-    Ok(())
-}
-
-async fn run_variant(variant: AgentVariant, tasks: Vec<PlannedTask>) -> Result<(), AnyError> {
-    let output = PathBuf::from("nanoeval-sweep-runs").join(variant.spec().id().as_str());
-    let (eval, _events) = Nanoeval::builder(variant.nanocodex().clone())
-        .output_directory(output)
-        .max_concurrency(usize::from(K))
+    println!("planned {} independent attempts", sweep.attempt_count());
+    let (eval, _events) = Nanoeval::builder(nanocodex)
+        .output_directory("nanoeval-sweep-runs/tools")
+        .max_concurrency(sweep.attempt_count())
         .build()?;
-    let attempts = tasks
-        .into_iter()
-        .flat_map(|task| std::iter::repeat_n(task.task().clone(), usize::from(task.trials())));
-    let results = eval.tasks(attempts).await?;
-    println!(
-        "{} [{}]: {} completed attempts",
-        variant.spec().id(),
-        variant.spec().tools(),
-        results.len()
-    );
+    let results = eval.sweep(sweep).await?;
+    for agent in ["without-mcp", "with-docs-mcp"] {
+        let completed = results
+            .attempts()
+            .iter()
+            .filter(|attempt| attempt.agent().as_str() == agent)
+            .count();
+        println!("{agent}: {completed} completed attempts");
+    }
     Ok(())
 }
 

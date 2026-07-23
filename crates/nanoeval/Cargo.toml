@@ -19,13 +19,16 @@ futures-util.workspace = true
 nanocodex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

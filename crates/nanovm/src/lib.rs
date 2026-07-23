@@ -10,7 +10,7 @@ mod krun;
 
 pub use capabilities::{Capabilities, KrunFeature};
 pub use command::GuestCommand;
-pub use config::{Network, VmConfig};
+pub use config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig};
 pub use krun::{KrunVm, KrunVmControl, VmError};
 
 /// The complete upstream libkrun API pinned by this workspace's lockfile.

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::Task;
+use crate::{AgentId, Task};
 
 /// Terminal score classification for one attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -27,6 +27,74 @@ pub struct EvalResult {
     pub artifacts: EvalArtifacts,
     #[serde(skip)]
     pub(crate) task: Task,
+}
+
+/// Results from an advanced task-by-agent-by-trial sweep.
+#[derive(Clone, Debug, Serialize)]
+pub struct SweepResults {
+    attempts: Vec<SweepAttemptResult>,
+}
+
+/// One self-identifying result in a [`SweepResults`] collection.
+#[derive(Clone, Debug, Serialize)]
+pub struct SweepAttemptResult {
+    agent: AgentId,
+    trial: u16,
+    result: EvalResult,
+}
+
+impl SweepResults {
+    pub(crate) const fn new(attempts: Vec<SweepAttemptResult>) -> Self {
+        Self { attempts }
+    }
+
+    #[must_use]
+    pub fn attempts(&self) -> &[SweepAttemptResult] {
+        &self.attempts
+    }
+
+    #[must_use]
+    pub fn into_results(self) -> Vec<EvalResult> {
+        self.attempts
+            .into_iter()
+            .map(|attempt| attempt.result)
+            .collect()
+    }
+}
+
+impl SweepAttemptResult {
+    pub(crate) const fn new(agent: AgentId, trial: u16, result: EvalResult) -> Self {
+        Self {
+            agent,
+            trial,
+            result,
+        }
+    }
+
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        &self.result.task_name
+    }
+
+    #[must_use]
+    pub const fn agent(&self) -> &AgentId {
+        &self.agent
+    }
+
+    #[must_use]
+    pub const fn trial(&self) -> u16 {
+        self.trial
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> &EvalResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub fn into_result(self) -> EvalResult {
+        self.result
+    }
 }
 
 impl EvalResult {

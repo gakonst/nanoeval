@@ -1,16 +1,20 @@
 mod config;
 mod eval;
+mod observability;
+mod vm_image;
 
 use std::{
     collections::BTreeMap,
     io::{self, Write},
     path::{Path, PathBuf},
+    str::FromStr,
+    time::Instant,
 };
 
 use clap::{CommandFactory, Parser, Subcommand};
 use eyre::{Result, eyre};
 use nanoeval::Task;
-use nanovm::{GuestCommand, KrunVm, VmConfig};
+use nanovm::{BlockDevice, GuestCommand, KrunVm, SharedDirectory, VmConfig};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -52,11 +56,30 @@ enum Command {
 
 #[derive(Subcommand)]
 enum VmCommand {
+    /// Prepare one or more tasks' Linux/ARM64 root disks without running agents.
+    Prepare {
+        /// Terminal-Bench task directory. Repeat to prepare several environments.
+        #[arg(long = "task", required = true, value_name = "DIRECTORY")]
+        tasks: Vec<PathBuf>,
+
+        /// Content-addressed VM cache directory.
+        #[arg(long, default_value = ".cache/vm")]
+        cache: PathBuf,
+
+        /// Resolve the image reference at the registry even when locally cached.
+        #[arg(long)]
+        refresh: bool,
+    },
+
     /// Boot a root filesystem and replace Nanoeval with the guest command.
     Run {
         /// Linux root filesystem directory exposed to the guest.
         #[arg(long)]
         root: PathBuf,
+
+        /// Treat `--root` as a raw ext4 block image instead of a virtiofs directory.
+        #[arg(long)]
+        ext4: bool,
 
         /// Number of virtual CPUs.
         #[arg(long, default_value_t = 2)]
@@ -66,16 +89,261 @@ enum VmCommand {
         #[arg(long, default_value_t = 1024)]
         memory_mib: u32,
 
+        /// Read-only directory containing the guest tool runtime.
+        #[arg(long, value_name = "DIRECTORY")]
+        runtime_directory: Option<PathBuf>,
+
+        /// Writable host directory exposed as TAG through virtiofs.
+        #[arg(long, value_name = "TAG=DIRECTORY")]
+        writable_share: Vec<WritableShare>,
+
+        /// Immutable block image attached as ID after the root disk.
+        #[arg(long, value_name = "ID=IMAGE")]
+        read_only_disk: Vec<ReadOnlyDisk>,
+
+        /// Private writable block image attached as ID after the root disk.
+        #[arg(long, value_name = "ID=IMAGE")]
+        writable_disk: Vec<ReadOnlyDisk>,
+
+        /// Environment entry inherited by the guest's initial process.
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        environment: Vec<GuestEnvironment>,
+
         /// Executable and arguments to run inside the guest.
         #[arg(required = true, trailing_var_arg = true)]
         guest_command: Vec<std::ffi::OsString>,
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Clone)]
+struct WritableShare {
+    tag: String,
+    directory: PathBuf,
+}
+
+#[derive(Clone)]
+struct ReadOnlyDisk {
+    id: String,
+    image: PathBuf,
+}
+
+#[derive(Clone)]
+struct GuestEnvironment {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum WritableShareParseError {
+    #[error("writable share must have the form TAG=DIRECTORY")]
+    MissingSeparator,
+
+    #[error("writable share tag must contain only ASCII letters, digits, '-' or '_'")]
+    InvalidTag,
+
+    #[error("writable share directory must not be empty")]
+    EmptyDirectory,
+}
+
+impl FromStr for WritableShare {
+    type Err = WritableShareParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (tag, directory) = value
+            .split_once('=')
+            .ok_or(WritableShareParseError::MissingSeparator)?;
+        if tag.is_empty()
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(WritableShareParseError::InvalidTag);
+        }
+        if directory.is_empty() {
+            return Err(WritableShareParseError::EmptyDirectory);
+        }
+        Ok(Self {
+            tag: tag.to_owned(),
+            directory: PathBuf::from(directory),
+        })
+    }
+}
+
+impl FromStr for ReadOnlyDisk {
+    type Err = WritableShareParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let share = WritableShare::from_str(value)?;
+        Ok(Self {
+            id: share.tag,
+            image: share.directory,
+        })
+    }
+}
+
+impl FromStr for GuestEnvironment {
+    type Err = GuestEnvironmentParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (name, value) = value
+            .split_once('=')
+            .ok_or(GuestEnvironmentParseError::MissingSeparator)?;
+        let mut bytes = name.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+            || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        {
+            return Err(GuestEnvironmentParseError::InvalidName);
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum GuestEnvironmentParseError {
+    #[error("guest environment must have the form NAME=VALUE")]
+    MissingSeparator,
+
+    #[error("guest environment name must be a shell identifier")]
+    InvalidName,
+}
+
+fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
-    run(Cli::parse()).await
+    let cli = Cli::parse();
+
+    if let Some(Command::Vm {
+        command:
+            VmCommand::Run {
+                root,
+                ext4,
+                cpus,
+                memory_mib,
+                runtime_directory,
+                writable_share,
+                read_only_disk,
+                writable_disk,
+                environment,
+                guest_command,
+            },
+    }) = &cli.command
+    {
+        return run_vm(RunVm {
+            root,
+            ext4: *ext4,
+            cpus: *cpus,
+            memory_mib: *memory_mib,
+            runtime_directory: runtime_directory.as_deref(),
+            writable_shares: writable_share,
+            read_only_disks: read_only_disk,
+            writable_disks: writable_disk,
+            environment,
+            guest_command,
+        });
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+#[derive(Clone, Copy)]
+struct RunVm<'a> {
+    root: &'a Path,
+    ext4: bool,
+    cpus: u8,
+    memory_mib: u32,
+    runtime_directory: Option<&'a Path>,
+    writable_shares: &'a [WritableShare],
+    read_only_disks: &'a [ReadOnlyDisk],
+    writable_disks: &'a [ReadOnlyDisk],
+    environment: &'a [GuestEnvironment],
+    guest_command: &'a [std::ffi::OsString],
+}
+
+fn run_vm(input: RunVm<'_>) -> Result<()> {
+    let (program, arguments) = input
+        .guest_command
+        .split_first()
+        .ok_or_else(|| eyre!("guest command must not be empty"))?;
+    let mut config = if input.ext4 {
+        VmConfig::ext4(input.root)
+    } else {
+        VmConfig::new(input.root)
+    }
+    .cpus(input.cpus)
+    .memory_mib(input.memory_mib);
+    if let Some(directory) = input.runtime_directory {
+        config = config.shared_directory(SharedDirectory::read_only("nanoeval-tools", directory));
+    }
+    for share in input.writable_shares {
+        config = config.shared_directory(SharedDirectory::read_write(
+            share.tag.clone(),
+            share.directory.clone(),
+        ));
+    }
+    for disk in input.read_only_disks {
+        config = config.block_device(BlockDevice::read_only(disk.id.clone(), disk.image.clone()));
+    }
+    for disk in input.writable_disks {
+        config = config.block_device(BlockDevice::read_write(disk.id.clone(), disk.image.clone()));
+    }
+    let mut command = GuestCommand::new(program).args(arguments);
+    for entry in input.environment {
+        command = command.env(&entry.name, &entry.value);
+    }
+    KrunVm::new(&config)?.run(&command)?;
+    Ok(())
+}
+
+async fn prepare_tasks(tasks: Vec<PathBuf>, cache: PathBuf, refresh: bool) -> Result<()> {
+    let preparation_started = Instant::now();
+    let tasks = tasks
+        .into_iter()
+        .map(Task::load)
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = if refresh {
+        vm_image::CachePolicy::Refresh
+    } else {
+        vm_image::CachePolicy::Reuse
+    };
+    // Resolve the running, entitled VMM executable before a nested guest
+    // runtime build can cause Cargo's runner cache to rotate paths.
+    let vmm = std::env::current_exe()?;
+    let runtime_started = Instant::now();
+    let runtime_image = eval::prepare_vm_guest_runtime().await?;
+    let runtime_duration = runtime_started.elapsed();
+    let builder = vm_image::VmImageBuilder::new(vmm, runtime_image, ".cache/libkrunfw/libkrunfw");
+    let mut cache_hits = 0_usize;
+    let mut cache_creations = 0_usize;
+    for task in tasks {
+        let task_started = Instant::now();
+        let prepared = vm_image::PreparedRootDisk::prepare(&task, &cache, policy, &builder).await?;
+        match prepared.disk_status() {
+            vm_image::DiskStatus::Hit => cache_hits += 1,
+            vm_image::DiskStatus::Created => cache_creations += 1,
+        }
+        eprintln!(
+            "{}: manifest={} ({}) root_disk={} duration={:.3?}",
+            task.name(),
+            prepared.manifest_digest(),
+            prepared.manifest_source().as_str(),
+            prepared.disk_status().as_str(),
+            task_started.elapsed()
+        );
+        println!("{}", prepared.path().display());
+    }
+    eprintln!(
+        "VM preparation: runtime={runtime_duration:.3?} environments={} hits={cache_hits} created={cache_creations} total={:.3?}",
+        cache_hits + cache_creations,
+        preparation_started.elapsed()
+    );
+    Ok(())
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -105,19 +373,39 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Vm {
             command:
+                VmCommand::Prepare {
+                    tasks,
+                    cache,
+                    refresh,
+                },
+        } => prepare_tasks(tasks, cache, refresh).await?,
+        Command::Vm {
+            command:
                 VmCommand::Run {
                     root,
+                    ext4,
                     cpus,
                     memory_mib,
+                    runtime_directory,
+                    writable_share,
+                    read_only_disk,
+                    writable_disk,
+                    environment,
                     guest_command,
                 },
         } => {
-            let (program, arguments) = guest_command
-                .split_first()
-                .ok_or_else(|| eyre!("guest command must not be empty"))?;
-            let config = VmConfig::new(root).cpus(cpus).memory_mib(memory_mib);
-            let command = GuestCommand::new(program).args(arguments);
-            KrunVm::new(&config)?.run(&command)?;
+            run_vm(RunVm {
+                root: &root,
+                ext4,
+                cpus,
+                memory_mib,
+                runtime_directory: runtime_directory.as_deref(),
+                writable_shares: &writable_share,
+                read_only_disks: &read_only_disk,
+                writable_disks: &writable_disk,
+                environment: &environment,
+                guest_command: &guest_command,
+            })?;
         }
     }
     Ok(())
@@ -206,5 +494,60 @@ impl TaskOutput<'_> {
             writeln!(output, "\n{}", self.prompt)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, str::FromStr};
+
+    use clap::Parser;
+
+    use super::{Cli, Command, ReadOnlyDisk, VmCommand, WritableShare};
+
+    #[test]
+    fn writable_share_is_a_strict_tag_and_directory_pair() {
+        let share = WritableShare::from_str("nanoeval-cache=/tmp/cache").unwrap();
+        assert_eq!(share.tag, "nanoeval-cache");
+        assert_eq!(share.directory, Path::new("/tmp/cache"));
+
+        assert!(WritableShare::from_str("missing-directory=").is_err());
+        assert!(WritableShare::from_str("bad tag=/tmp/cache").is_err());
+        assert!(WritableShare::from_str("/tmp/cache").is_err());
+    }
+
+    #[test]
+    fn read_only_disk_uses_the_same_strict_pair_shape() {
+        let disk = ReadOnlyDisk::from_str("runtime=/tmp/runtime.ext4").unwrap();
+        assert_eq!(disk.id, "runtime");
+        assert_eq!(disk.image, Path::new("/tmp/runtime.ext4"));
+    }
+
+    #[test]
+    fn prepare_accepts_repeated_tasks_in_input_order() {
+        let cli = Cli::try_parse_from([
+            "nanoeval",
+            "vm",
+            "prepare",
+            "--task",
+            "tasks/first",
+            "--task",
+            "tasks/second",
+        ])
+        .unwrap();
+        let Some(Command::Vm {
+            command: VmCommand::Prepare { tasks, .. },
+        }) = cli.command
+        else {
+            panic!("expected vm prepare command");
+        };
+
+        assert_eq!(
+            tasks,
+            [
+                Path::new("tasks/first").to_path_buf(),
+                Path::new("tasks/second").to_path_buf()
+            ]
+        );
     }
 }

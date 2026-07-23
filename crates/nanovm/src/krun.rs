@@ -8,9 +8,13 @@ use std::{
 
 use thiserror::Error;
 
-use crate::{GuestCommand, Network, VmConfig};
+use crate::{BlockDevice, GuestCommand, Network, RootFilesystem, SharedDirectory, VmConfig};
 
 const ROOT_TAG: &std::ffi::CStr = c"/dev/root";
+const ROOT_BLOCK_ID: &std::ffi::CStr = c"root";
+const ROOT_BLOCK_DEVICE: &std::ffi::CStr = c"/dev/vda";
+const EXT4_FILESYSTEM: &std::ffi::CStr = c"ext4";
+const ROOT_MOUNT_OPTIONS: &std::ffi::CStr = c"rw";
 const TSI_HIJACK_INET: u32 = 1;
 
 #[derive(Debug, Error)]
@@ -23,6 +27,15 @@ pub enum VmError {
 
     #[error("root filesystem is not a directory: {0}")]
     RootNotDirectory(PathBuf),
+
+    #[error("root disk is not a file: {0}")]
+    RootNotFile(PathBuf),
+
+    #[error("block device is not a file: {0}")]
+    BlockDeviceNotFile(PathBuf),
+
+    #[error("shared directory is not a directory: {0}")]
+    SharedDirectoryNotDirectory(PathBuf),
 
     #[error("{field} contains a NUL byte")]
     Nul {
@@ -71,8 +84,14 @@ impl KrunVm {
                 path: config.root().to_path_buf(),
                 source,
             })?;
-        if !root.is_dir() {
-            return Err(VmError::RootNotDirectory(root));
+        match config.root_filesystem() {
+            RootFilesystem::Directory(_) if !root.is_dir() => {
+                return Err(VmError::RootNotDirectory(root));
+            }
+            RootFilesystem::Ext4(_) if !root.is_file() => {
+                return Err(VmError::RootNotFile(root));
+            }
+            RootFilesystem::Directory(_) | RootFilesystem::Ext4(_) => {}
         }
 
         let context = positive_context(krun::krun_create_ctx(), "create context")?;
@@ -86,14 +105,49 @@ impl KrunVm {
         )?;
 
         let root = c_string(root.as_os_str(), "root filesystem path")?;
-        // SAFETY: both C strings live through the call and libkrun copies their
-        // contents into the context before returning.
-        check(
-            unsafe {
-                krun::krun_add_virtiofs3(context, ROOT_TAG.as_ptr(), root.as_ptr(), 0, false)
-            },
-            "attach root filesystem",
-        )?;
+        match config.root_filesystem() {
+            RootFilesystem::Directory(_) => {
+                // SAFETY: both C strings live through the call and libkrun copies their
+                // contents into the context before returning.
+                check(
+                    unsafe {
+                        krun::krun_add_virtiofs3(
+                            context,
+                            ROOT_TAG.as_ptr(),
+                            root.as_ptr(),
+                            0,
+                            false,
+                        )
+                    },
+                    "attach root filesystem",
+                )?;
+            }
+            RootFilesystem::Ext4(_) => {
+                // SAFETY: the path and block ID remain alive through each call;
+                // libkrun copies them into its context before returning.
+                check(
+                    unsafe {
+                        krun::krun_add_disk(context, ROOT_BLOCK_ID.as_ptr(), root.as_ptr(), false)
+                    },
+                    "attach root disk",
+                )?;
+                // SAFETY: all strings are static and NUL terminated.
+                check(
+                    unsafe {
+                        krun::krun_set_root_disk_remount(
+                            context,
+                            ROOT_BLOCK_DEVICE.as_ptr(),
+                            EXT4_FILESYSTEM.as_ptr(),
+                            ROOT_MOUNT_OPTIONS.as_ptr(),
+                        )
+                    },
+                    "select root disk",
+                )?;
+            }
+        }
+
+        attach_block_devices(context, config.block_devices())?;
+        attach_shared_directories(context, config.shared_directories())?;
 
         let stdin = io::stdin();
         let stdout = io::stdout();
@@ -205,6 +259,64 @@ impl KrunVm {
         check(krun::krun_start_enter(context), "start VM")?;
         Err(VmError::UnexpectedReturn)
     }
+}
+
+fn attach_block_devices(context: u32, devices: &[BlockDevice]) -> Result<(), VmError> {
+    for device in devices {
+        let path = device
+            .path()
+            .canonicalize()
+            .map_err(|source| VmError::ResolveRoot {
+                path: device.path().to_path_buf(),
+                source,
+            })?;
+        if !path.is_file() {
+            return Err(VmError::BlockDeviceNotFile(path));
+        }
+        let id = c_string(OsStr::new(device.id()), "block device ID")?;
+        let path = c_string(path.as_os_str(), "block device path")?;
+        // SAFETY: both strings remain valid through the call and libkrun
+        // copies their contents into the context before returning.
+        check(
+            unsafe {
+                krun::krun_add_disk(context, id.as_ptr(), path.as_ptr(), device.is_read_only())
+            },
+            "attach block device",
+        )?;
+    }
+    Ok(())
+}
+
+fn attach_shared_directories(context: u32, directories: &[SharedDirectory]) -> Result<(), VmError> {
+    for directory in directories {
+        let path = directory
+            .path()
+            .canonicalize()
+            .map_err(|source| VmError::ResolveRoot {
+                path: directory.path().to_path_buf(),
+                source,
+            })?;
+        if !path.is_dir() {
+            return Err(VmError::SharedDirectoryNotDirectory(path));
+        }
+        let tag = c_string(OsStr::new(directory.tag()), "shared directory tag")?;
+        let path = c_string(path.as_os_str(), "shared directory path")?;
+        // SAFETY: both C strings remain valid through the call and libkrun
+        // copies their contents into the context before returning.
+        check(
+            unsafe {
+                krun::krun_add_virtiofs3(
+                    context,
+                    tag.as_ptr(),
+                    path.as_ptr(),
+                    0,
+                    directory.is_read_only(),
+                )
+            },
+            "attach shared directory",
+        )?;
+    }
+    Ok(())
 }
 
 /// Out-of-band control for a VM running in libkrun's event loop.

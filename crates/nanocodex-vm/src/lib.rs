@@ -5,7 +5,7 @@ use std::{path::Path, sync::Arc};
 
 use nanocodex_tools::{StandardTool, Tool, ToolContext, ToolDefinition, ToolInput, ToolResult};
 
-pub use session::{VmToolSession, VmToolSessionError};
+pub use session::{VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError};
 
 /// One VM-aware execution capability shared by all proxied workspace tools.
 ///

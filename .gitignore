@@ -6,3 +6,5 @@
 /.nanoeval-vm-*/
 /nanoeval-runs/
 /nanoeval-native-runs/
+/nanoeval-*-runs*/
+/*.log

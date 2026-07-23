@@ -42,6 +42,11 @@ That leads to a few deliberate choices:
   into every task image.
 - Every attempt receives a fresh Nanocodex session, tool runtime, workspace,
   event sequence, and verifier run.
+- Attempts are assigned to bounded three-attempt prompt-cache cohorts. Each
+  cohort singleflights one Nanocodex warmup per exact prefix, so later attempts
+  skip the redundant request without creating one hot cache key for the whole
+  job. They do not share conversation history, response chains, sockets, tool
+  state, or workspace.
 - Typed results and typed events are the runtime contract. The optional Harbor
   adapter records one subscription as Harbor and ATIF artifacts.
 - Native execution provides the fastest development loop for host-safe tasks.
@@ -78,8 +83,7 @@ cargo run -- run \
   --thinking low
 ```
 
-Run the same evaluator with workspace tools inside independent libkrun VMs by
-supplying a prepared rootfs containing `nanocodex-vm-guest`:
+Run the same evaluator with workspace tools inside independent libkrun VMs:
 
 ```sh
 cargo run -- run \
@@ -87,7 +91,74 @@ cargo run -- run \
   --trials 5 \
   --concurrency 5 \
   --thinking low \
+  --vm \
   --vm-rootfs .cache/rootfs/alpine-3.24.1
+```
+
+Without `--vm-rootfs`, `--vm` prepares each distinct task's Linux/ARM64 root
+disk from OCI and caches it under `.cache/vm`. A multi-task job indexes those
+typed environments by canonical task root, so every attempt receives the right
+root disk, workdir, image environment, and detected shell. The typed builder
+accepts every Dockerfile
+instruction shape present in the 89 Terminal-Bench 2.1 tasks: `FROM` (including
+named multi-stage builds), `RUN`, `COPY` and `COPY --from`, absolute `WORKDIR`,
+`ENV`, `ARG`, and `CMD`. `CMD` is parsed but deliberately not started, matching
+Harbor's long-lived task-container override. Unknown instructions are rejected
+instead of approximated.
+`--vm-rootfs <path>` overrides preparation with either a raw ext4 image or the
+earlier trusted virtiofs directory for VM development.
+
+The local cache has three independent identities. A typed reference record maps
+the exact OCI reference to its resolved manifest and layer descriptors, so an
+unchanged local rerun does not contact the registry; `--vm-refresh` explicitly
+resolves the image again. The flattened ext4 template is keyed only by the
+resolved manifest, platform, converter version, and disk size. A complete build
+is keyed by the Dockerfile, deterministic context archive, every resolved stage
+manifest, platform, builder version, and disk size. Build contexts and prior
+stages are immutable block devices; `RUN` and `COPY` mutate only a temporary CoW
+stage disk, and the final disk is published atomically. Finally, the Nanocodex VM
+tool runtime has its own content identity. Each attempt reflinks the immutable
+ext4 template and mounts the current runtime as a read-only block disk.
+Consequently, ordinary harness or tool changes require only a Rust rebuild and
+VM restart, not an OCI pull or task-image rebuild.
+
+In a source checkout, `nanoeval run --vm` incrementally builds the static
+Linux/aarch64 guest runtime with Cargo, stages only that content-addressed
+binary under `.cache/vm/runtimes`, and exposes no source tree or general target
+directory to the guest. A typed build record validates the source binary's
+size and modification identity before reusing its digest, avoiding a repeated
+debug-mode SHA-256 pass. On macOS the Cargo runner similarly executes a
+content-addressed, entitled copy of the host binary. Cargo may replace its
+ordinary output with an unsigned linker artifact without invalidating the
+signed copy or causing a broken VMM child.
+
+Prepare one or more Terminal-Bench 2.1 environments without running agents:
+
+```sh
+cargo run -- vm prepare \
+  --task /path/to/terminal-bench-2-1/count-dataset-tokens \
+  --task /path/to/terminal-bench-2-1/regex-log
+```
+
+Preparation writes one root-disk path to stdout per task in input order and
+reports task identity, manifest source, cache status, and duration on stderr.
+The final preparation line separates guest-runtime time from the number of
+environment hits and creations and the total in-process duration. The guest
+runtime is prepared once for the whole command. Pass `--refresh` to the
+standalone command, or `--vm-refresh` to `nanoeval run`, when intentionally
+checking whether a mutable image reference now resolves to different content.
+
+The same repeated-task shape works for one concurrent VM-backed eval job:
+
+```sh
+cargo run -- run \
+  --task /path/to/task-a \
+  --task /path/to/task-b \
+  --task /path/to/task-c \
+  --trials 5 \
+  --concurrency 15 \
+  --thinking low \
+  --vm
 ```
 
 Every `--task` is one eval and `--trials` applies to each one. Run the complete
@@ -106,6 +177,70 @@ cargo run -- run \
 Nanoeval also reuses the ChatGPT authorization file managed by Codex and
 Nanocodex. Without `OPENAI_API_KEY`, it loads `${CODEX_HOME}/auth.json` or
 `~/.codex/auth.json`; `--auth-file` selects one explicitly.
+
+## Tracing and measurement
+
+Nanoeval emits the same application-owned `tracing` spans as Nanocodex. The CLI
+installs Nanocodex's observability stack, writes diagnostics to stderr by
+default, and can append structured JSON locally or export OTLP/HTTP traces:
+
+```sh
+cargo run -- run \
+  --task tasks/write-greeting \
+  --trials 5 \
+  --concurrency 5 \
+  --thinking low \
+  --vm \
+  --log-format json \
+  --log-file .cache/nanoeval-traces.jsonl
+```
+
+Pass `--otel-endpoint http://127.0.0.1:4318` to export the same span stream to
+an OpenTelemetry collector. `--log-filter` and `--otel-filter` independently
+control local and exported detail.
+
+Each `eval.attempt` is an independent root so concurrent trials appear as
+overlapping traces rather than one artificial serial job. Its important
+children are:
+
+| Span | Measurement |
+| --- | --- |
+| `eval.environment.setup` | Disposable task workspace preparation |
+| `eval.agent.setup` | Fresh Nanocodex build, attempt hook, rootfs materialization, and VMM child spawn |
+| `eval.agent.execution` | Complete agent turn; existing Nanocodex model and tool spans inherit this parent |
+| `eval.verifier` | Canonical verifier runtime, exit code, reward, and output sizes |
+| `vm.rootfs.materialize` | Current trusted-rootfs copy cost |
+| `vm.session.spawn` | Host VMM child-process spawn cost |
+| `vm.tool.rpc` | Console queue and round-trip latency, request/response sizes, session age, and first-call status |
+
+Every bounded span records `duration_ns`, `status`, and OpenTelemetry status.
+The attempt root also records aggregate tokens, cache hits and writes, warmup
+usage and duration, response attempts and retries, model/tool calls, reward,
+and cost. The first `vm.tool.rpc` includes guest boot/readiness time; later calls
+show warm transport and guest-tool latency. Full task prompts, verifier output,
+VM commands, and typed VM requests/responses are emitted as ordered span events,
+matching Nanocodex's full-fidelity tracing policy. Treat trace output as a copy
+of the evaluated conversation and tool activity.
+
+Every successful CLI invocation ends with one `evaluation run completed`
+record. It separates observability installation, task loading, guest-runtime
+lookup/build, task-environment preparation, evaluator setup, attempt wall time,
+Harbor finalization, output, and total in-process wall time. The same record
+aggregates model, warmup, guest-tool work/wall, and verifier time, response
+retries, and input/cache tokens across completed attempts. These aggregates are
+work totals, while `attempts_wall_duration_ns` is elapsed wall time and therefore
+remains meaningful under concurrency.
+
+Cargo compilation, linking, entitlement signing, and runner startup happen
+outside the process and are intentionally measured separately with
+`/usr/bin/time cargo run ...`. The development profile retains line-number
+backtraces without full variable debug info. Host-only source changes rotate the
+signed host executable but do not invalidate the Linux guest runtime, OCI
+layers, task root disks, or verifier dependency layers.
+
+Tracing remains diagnostic and application-owned. Library consumers may use
+`nanocodex-observability` or install any compatible `tracing` subscriber;
+Nanoeval's typed events and results remain the contractual API.
 
 ## API
 
@@ -137,9 +272,13 @@ let observer = tokio::spawn(async move {
 
 let first = eval.task(task.clone()).await?;
 let five_fresh_attempts = eval.task_n(task, 5).await?;
+let one_each = eval.tasks(vec![task.clone(), task.clone()]).await?;
+let five_each = eval.tasks_n(vec![task.clone(), task], 5).await?;
 assert!(first.artifacts.workspace.is_dir());
 observer.await??;
 # drop(five_fresh_attempts);
+# drop(one_each);
+# drop(five_each);
 # Ok(())
 # }
 ```
@@ -151,43 +290,46 @@ The runnable core-only consumer is
 OPENAI_API_KEY=... cargo run -p nanoeval-examples --bin native-task
 ```
 
-### Finite sweeps
+The default multi-task API deliberately takes a `Vec<Task>`: `tasks` runs each
+task once, while `tasks_n` runs each task `k` times. Callers do not construct a
+plan, scheduler slot, or run manifest.
 
-`EvalPlan` describes the deterministic task × agent variant × trial product
-without hiding how agents are configured. Every variant carries a stable,
-filesystem-safe identity, a typed thinking level, a stable tool-profile
-identity, and the exact cloneable `NanocodexBuilder` used to create each fresh
-session:
+### Advanced sweeps
+
+`Sweep` is the opt-in API for comparing several independently configured agent
+recipes across tasks and trials:
 
 ```rust,no_run
 # use nanocodex::{Nanocodex, Thinking};
-# use nanoeval::{AgentVariant, AgentVariantSpec, EvalPlan, Task, TrialCount};
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
+# use nanoeval::{Nanoeval, Sweep, Task};
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let task = Task::load("tasks/write-greeting")?;
-let auth = "api-key";
-let plan = EvalPlan::builder()
-    .task(task, TrialCount::new(5)?)
-    .variant(AgentVariant::new(
-        AgentVariantSpec::new("thinking-low", Thinking::Low, "defaults")?,
-        Nanocodex::builder(auth),
-    ))
-    .variant(AgentVariant::new(
-        AgentVariantSpec::new("thinking-high", Thinking::High, "defaults")?,
-        Nanocodex::builder(auth),
-    ))
+let nanocodex = Nanocodex::builder("api-key");
+let sweep = Sweep::builder()
+    .tasks(vec![task])
+    .trials(5)
+    .agent("thinking-low", nanocodex.clone().thinking(Thinking::Low))?
+    .agent("thinking-high", nanocodex.clone().thinking(Thinking::High))?
     .build()?;
 
-assert_eq!(plan.attempt_count(), 10);
+assert_eq!(sweep.attempt_count(), 10);
+let (eval, events) = Nanoeval::builder(nanocodex)
+    .max_concurrency(10)
+    .build()?;
+let results = eval.sweep(sweep).await?;
+assert_eq!(results.attempts().len(), 10);
+assert_eq!(results.attempts()[0].agent().as_str(), "thinking-low");
+# drop(events);
 # Ok(())
 # }
 ```
 
-The plan expands in task, variant, then one-based trial order. It does not
-share a Nanocodex conversation, workspace, tool runtime, or event sequence
-between entries. `EvalPlan` is a typed description in this first slice, not a
-combined executor or Harbor job; the examples run its variants concurrently
-with ordinary Tokio composition and retain a separate Nanoeval job for each
-variant. See the compiled
+The sweep expands in task, agent, then one-based trial order. Every
+`SweepAttemptResult` exposes its agent ID, trial number, and ordinary
+`EvalResult`; sessions, workspaces, tool runtimes, and event sequences remain
+independent. Nanoeval privately retains `run.json` with canonical task roots,
+trial count, and stable agent IDs, but never credentials or opaque builder
+state. See the compiled
 [`thinking-sweep`](examples/src/bin/thinking_sweep.rs) and
 [`tool-sweep`](examples/src/bin/tool_sweep.rs) consumers for executable `k=5`
 thinking and default-tools-versus-MCP examples.
@@ -380,7 +522,8 @@ let (eval, events) = Nanoeval::builder(agent)
             .tool(vm.view_image_tool())
             .tool(UpdatePlanTool::new())
             .build()?;
-        Ok(builder.tools(tools))
+        Ok(nanoeval::AttemptAgent::new(builder.tools(tools))
+            .verifier(vm_verifier_for_the_retained_session(attempt)?))
     })
     .max_concurrency(15)
     .build()?;
@@ -406,6 +549,103 @@ trusted 15 MiB Alpine directory into every retained attempt and exposes that
 directory through writable virtiofs. The 15-trial job therefore occupies 232
 MiB. Immutable rootfs snapshots, a private CoW workspace, guest confinement,
 and a warm multi-attempt VM pool remain the next isolation/storage slice.
+
+The newer canonical proof uses a raw sparse ext4 block device instead of
+virtiofs. `count-dataset-tokens` was rebuilt from the Linux/ARM64
+`python:3.13-slim-bookworm` OCI layers and executed in one APFS CoW clone. The
+unmodified verifier passed with
+answer `79586` and reward `1`; the retained output includes the mutated ext4
+disk, `answer.txt`, `ctrf.json`, ATIF-v1.7 trajectory, and Harbor-shaped result.
+This is intentionally still a one-task/one-trial gate.
+
+On the July 22, 2026 Apple Silicon development host, a clean cache took 8.13
+seconds to resolve, download, flatten, and create the 10 GiB sparse ext4 image;
+retained OCI blobs reduced a fresh flatten to 4.12 seconds. The unchanged local
+image path now takes 0.03--0.04 seconds in the built binary (1.08 seconds through
+warm `cargo run`). Fresh VM boot plus the
+first typed command takes 0.16--0.22 seconds. The latest complete warm trial
+took 83.55 seconds at the CLI and retained 82.12 seconds: 76.61 seconds of agent
+execution and 5.49 seconds of unmodified verification. Environment setup was
+0.38 ms, agent/VMM setup was 1.88 ms, and the CoW clone plus VMM child spawn was
+1.61 ms. Model calls accounted for 54.27 seconds and guest tool work for 21.53
+seconds; the verifier spent nearly all of its time installing curl, uv, and
+pytest before its 0.01-second test. The retained Harbor result has reward `1`,
+answer `79586`, 11 ATIF steps, 175,602 input tokens, and 133,120 cached input
+tokens. These numbers make dependency acquisition and model behavior the next
+material targets; VM RPC and attempt construction are already noise.
+
+Verifier setup is shared benchmark infrastructure rather than a task-specific
+corner case. All 89 Terminal-Bench 2.1 verifier scripts install dependencies at
+runtime; 82 run `apt-get update`, 82 use the same pinned uv 0.9.5 installer and
+`uvx` pattern, and 66 install exactly `curl`. Running the unchanged
+`count-dataset-tokens` verifier twice in one disposable guest measured 6.445
+seconds cold and 2.784 seconds warm. The cache must remain a post-agent layer:
+baking it into the task image would expose curl, uv, pytest, package metadata,
+and different command behavior to the agent before Harbor would.
+
+The VM lifecycle now has the required phase boundary: after the agent turn, a
+typed control request runs guest `sync`, acknowledges it over the console, and
+waits for the VMM child to exit successfully. Nanoeval then boots a fresh
+verifier guest from an APFS CoW clone of the complete mutated ext4 disk and
+shuts that guest down through the same path after collecting artifacts. A real
+two-boot disk check retained a guest-written file across the boundary. This
+costs one roughly 0.2-second boot and ensures no live agent process, verifier
+mutation, or stale buffered write crosses the phase boundary.
+
+The warm path now preserves the post-agent disk, clones it for verification,
+and attaches a content-addressed, private CoW ext4 dependency disk. No verifier
+cache directory is exposed from the host through virtiofs. The dependency key
+includes the base ext4 identity, architecture, complete verifier script, disk
+geometry, and cache builder version. Unknown verifier shapes keep executing
+cold. A miss runs the byte-for-byte canonical script and atomically publishes a
+cache only after the pinned uv installation exists. A hit starts the same
+untouched script at its recognized post-bootstrap byte boundary, after sourcing
+the cached uv environment; the task-owned test and reward logic is unchanged.
+Each hit receives a private CoW clone, so concurrent trials never share writable
+package state. The private cache disk is deleted after successful artifact
+collection; the content-addressed cache remains, while retained jobs keep only
+the mutated task/verifier roots and Harbor evidence.
+
+`regex-log` supplied the second canonical task proof and a different base image,
+`ubuntu:24.04`. Direct OCI images leave `/etc/resolv.conf` for the container
+runtime to inject, so Nanoeval now copies only validated host nameserver IPs into
+each ext4 guest before starting its runtime. The untouched task passed twice
+with reward `1`, one passing CTRF test, six ATIF-v1.7 steps, and four tool-bearing
+steps. The original directory-cache hit took 7.695 seconds while reinstalling
+curl and uv. With the final task-sized cache geometry, the private block-cache
+hit took 0.960 seconds, an 87.5% verifier reduction, produced reward `1`, and
+retained the passing CTRF result. End-to-end wall time was 43.72 seconds, of
+which 39.07 seconds was agent execution; VM and agent setup took 63.3 ms. The
+VMM command contained one private
+`--writable-disk` and no `--writable-share`.
+
+The first latest-master hill-climb baseline pinned Nanocodex at
+`621300f0db6d485a62f0a81344f7ae879a1964e0` and ran `regex-log` at `k=5`,
+concurrency 5. All five independent VM attempts passed in 60.39 seconds wall
+time with no retries or errors. Agent turns ranged from 31.07 to 57.83 seconds;
+guest tool work was only 15.5--23.9 ms. All five verifier caches hit, verifier
+time was 0.543--0.616 seconds for four trials with one 2.286-second contention
+outlier, and every retained reward/CTRF pair passed. The trajectories show the
+next climb belongs in agent behavior: every rollout spent at least one extra
+model/tool round trip probing an unavailable Python runtime, while VM RPC and
+verification are no longer material.
+The same run showed that retaining five disposable cache clones consumed about
+1.0 GiB, so successful attempts now discard those clones after publishing or
+reusing the authoritative cache. The live follow-up retained 218 MiB (the
+109-MiB mutated agent root and 109-MiB verifier root), no `cache.ext4`, reward
+`1`, and the passing CTRF result; warm verification remained 0.963 seconds.
+
+The instrumented repeat path makes cache behavior explicit. Three warm task
+environment hits took 23 ms inside the built binary (0.58 ms runtime lookup and
+21 ms of environment validation), 0.03 seconds end to end via that binary, and
+1.42 seconds through unchanged `cargo run`. After a host-only evaluator edit, a
+real VM-backed `write-greeting` run still reported both the guest runtime and
+root disk as hits: runtime preparation took 3.45 ms, environment preparation
+18.69 ms, evaluator setup 4.74 ms, and Harbor finalization 4.17 ms. The
+29.84-second in-process total was dominated by 28.60 seconds of model work;
+guest tool work was 9.69 ms and fresh-guest verification 285.86 ms. The retained
+Harbor job passed with reward `1`, 4 ATIF-v1.7 steps, and 23,808 of 25,714 agent
+input tokens served from cache.
 
 ## Tasks
 

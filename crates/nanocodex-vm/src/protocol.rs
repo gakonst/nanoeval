@@ -3,6 +3,95 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 #[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub(crate) enum SessionRequest {
+    Tool(ToolRequest),
+    WriteFile(WriteFileRequest),
+    ReadFile(ReadFileRequest),
+    Execute(ExecuteRequest),
+    Shutdown(ShutdownRequest),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub(crate) enum SessionResponse {
+    Tool(ToolResponse),
+    WriteFile(ControlResponse),
+    ReadFile(ReadFileResponse),
+    Execute(ExecuteResponse),
+    Shutdown(ControlResponse),
+}
+
+impl SessionResponse {
+    pub const fn id(&self) -> u64 {
+        match self {
+            Self::Tool(response) => response.id,
+            Self::WriteFile(response) | Self::Shutdown(response) => response.id,
+            Self::ReadFile(response) => response.id,
+            Self::Execute(response) => response.id,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ShutdownRequest {
+    pub id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WriteFileRequest {
+    pub id: u64,
+    pub path: String,
+    pub contents: Vec<u8>,
+    pub mode: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadFileRequest {
+    pub id: u64,
+    pub path: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecuteRequest {
+    pub id: u64,
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub current_directory: String,
+    pub environment: Vec<(String, String)>,
+    pub timeout_millis: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControlResponse {
+    pub id: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadFileResponse {
+    pub id: u64,
+    pub contents: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecuteResponse {
+    pub id: u64,
+    pub exit_code: Option<i32>,
+    pub stdout: Option<Vec<u8>>,
+    pub stderr: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ToolRequest {
     pub id: u64,
@@ -23,7 +112,17 @@ mod tests {
     use nanocodex_tools::{ToolExecution, ToolInput};
     use serde_json::{json, value::to_raw_value};
 
-    use super::{ToolRequest, ToolResponse, WireToolContext, WireToolInput};
+    use super::{
+        SessionRequest, ShutdownRequest, ToolRequest, ToolResponse, WireToolContext, WireToolInput,
+    };
+
+    #[test]
+    fn shutdown_request_has_a_stable_typed_shape() {
+        let request = SessionRequest::Shutdown(ShutdownRequest { id: 9 });
+        let encoded = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(encoded, r#"{"kind":"shutdown","payload":{"id":9}}"#);
+    }
 
     #[test]
     fn function_request_round_trips_opaque_arguments() {
@@ -58,7 +157,7 @@ mod tests {
         );
         let encoded = serde_json::to_string(&response).unwrap();
         let decoded = serde_json::from_str::<ToolResponse>(&encoded).unwrap();
-        assert_eq!(decoded.id(), 8);
+        assert_eq!(decoded.id, 8);
     }
 }
 
@@ -112,9 +211,5 @@ impl ToolResponse {
             execution: None,
             error: Some(error),
         }
-    }
-
-    pub const fn id(&self) -> u64 {
-        self.id
     }
 }

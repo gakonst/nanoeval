@@ -3,14 +3,42 @@ set -eu
 
 binary=$1
 shift
+
+requires_hypervisor=false
+if [ "${1:-}" = vm ] && { [ "${2:-}" = run ] || [ "${2:-}" = prepare ]; }; then
+    requires_hypervisor=true
+else
+    for argument in "$@"; do
+        if [ "$argument" = --vm ]; then
+            requires_hypervisor=true
+            break
+        fi
+    done
+fi
+
+if [ "$requires_hypervisor" = false ]; then
+    exec "$binary" "$@"
+fi
+
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_dir=$(dirname -- "$script_dir")
+entitlements="$repository_dir/nanoeval.entitlements"
+binary_digest=$(shasum -a 256 "$binary" | cut -d ' ' -f 1)
+entitlements_digest=$(shasum -a 256 "$entitlements" | cut -d ' ' -f 1)
+signed_directory="$repository_dir/target/nanoeval-signed/$binary_digest-$entitlements_digest"
+signed_binary="$signed_directory/nanoeval"
 
-codesign \
-    --entitlements "$repository_dir/nanoeval.entitlements" \
-    --force \
-    --sign - \
-    "$binary"
+if [ ! -x "$signed_binary" ]; then
+    mkdir -p "$signed_directory"
+    temporary_binary="$signed_directory/nanoeval.$$.tmp"
+    cp "$binary" "$temporary_binary"
+    codesign \
+        --entitlements "$entitlements" \
+        --force \
+        --sign - \
+        "$temporary_binary"
+    mv -f "$temporary_binary" "$signed_binary"
+fi
 
 firmware_dir="$repository_dir/.cache/libkrunfw/v5.5.0/libkrunfw"
 if [ -f "$firmware_dir/libkrunfw.5.dylib" ]; then
@@ -22,4 +50,4 @@ if [ -f "$firmware_dir/libkrunfw.5.dylib" ]; then
     export DYLD_LIBRARY_PATH
 fi
 
-exec "$binary" "$@"
+exec "$signed_binary" "$@"
