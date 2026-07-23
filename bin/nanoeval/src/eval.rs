@@ -137,14 +137,15 @@ impl Eval {
         let progress = tokio::spawn(report_progress(events.subscribe(), attempt_count));
         let evaluation_setup = evaluation_setup_started.elapsed();
         let attempts_started = Instant::now();
-        let (results, run_error) = match eval.sweep(sweep).await {
-            Ok(results) => (results.into_results(), None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
+        let sweep_result = eval.sweep(sweep).await;
         let attempts = attempts_started.elapsed();
         let harbor_finish_started = Instant::now();
         let job = harbor.finish_all(attempt_count).await?;
-        progress.await??;
+        let progress = progress.await??;
+        let (results, run_error) = match sweep_result {
+            Ok(results) => (results.into_results(), None),
+            Err(error) => (progress.results, Some(error)),
+        };
         let harbor_finish = harbor_finish_started.elapsed();
         let output_started = Instant::now();
         if self.json {
@@ -165,7 +166,7 @@ impl Eval {
             output,
             total: total_started.elapsed(),
         }
-        .record(&results);
+        .record(&results, attempt_count, progress.failed);
         if let Some(error) = run_error {
             return Err(error.into());
         }
@@ -235,7 +236,7 @@ struct RunMeasurements {
 }
 
 impl RunMeasurements {
-    fn record(&self, results: &[EvalResult]) {
+    fn record(&self, results: &[EvalResult], attempt_count: usize, errored_attempt_count: usize) {
         let model_ns = results
             .iter()
             .map(|result| result.agent.metadata.model_duration_ns)
@@ -288,7 +289,9 @@ impl RunMeasurements {
             attempts_wall_duration_ns = duration_ns(self.attempts),
             harbor_finish_duration_ns = duration_ns(self.harbor_finish),
             output_duration_ns = duration_ns(self.output),
-            attempt_count = results.len(),
+            attempt_count,
+            scored_attempt_count = results.len(),
+            errored_attempt_count,
             attempts_model_duration_ns = model_ns,
             attempts_warmup_duration_ns = warmup_ns,
             attempts_tool_work_duration_ns = tool_work_ns,
@@ -1314,8 +1317,15 @@ fn copy_root_entries(source: &Path, destination: &Path, root: bool) -> Result<()
     Ok(())
 }
 
-async fn report_progress(mut events: NanoevalEventStream, expected: usize) -> Result<()> {
+struct Progress {
+    results: Vec<EvalResult>,
+    failed: usize,
+}
+
+async fn report_progress(mut events: NanoevalEventStream, expected: usize) -> Result<Progress> {
     let mut completed = 0;
+    let mut results = Vec::new();
+    let mut failed = 0;
     while completed < expected {
         let event = events
             .recv()
@@ -1327,10 +1337,12 @@ async fn report_progress(mut events: NanoevalEventStream, expected: usize) -> Re
             }
             EvalEventKind::Completed(result) => {
                 completed += 1;
+                results.push(result.as_ref().clone());
                 eprintln!("{}: {:?}", event.trial_name, result.status);
             }
             EvalEventKind::Failed(failure) => {
                 completed += 1;
+                failed += 1;
                 eprintln!("{}: Errored ({:?})", event.trial_name, failure.kind);
             }
             EvalEventKind::Agent(_)
@@ -1339,7 +1351,7 @@ async fn report_progress(mut events: NanoevalEventStream, expected: usize) -> Re
             | EvalEventKind::VerifierCompleted(_) => {}
         }
     }
-    Ok(())
+    Ok(Progress { results, failed })
 }
 
 #[cfg(test)]
