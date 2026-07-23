@@ -21,8 +21,9 @@ pub use event::{
     EvalEvent, EvalEventKind, EvalEventStreamError, NanoevalEventStream, NanoevalEvents,
 };
 pub use result::{
-    AgentMetadata, AgentResult, AgentStatus, EvalArtifacts, EvalResult, EvalStatus, EvalTiming,
-    PhaseTiming, SweepAttemptResult, SweepResults, UsageTotals, VerifierResult,
+    AgentMetadata, AgentResult, AgentStatus, EvalArtifacts, EvalFailure, EvalFailureKind,
+    EvalResult, EvalStatus, EvalTiming, PhaseTiming, SweepAttemptResult, SweepResults, UsageTotals,
+    VerifierResult,
 };
 pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier};

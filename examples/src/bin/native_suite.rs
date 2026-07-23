@@ -91,6 +91,10 @@ async fn observe(
                 completed += 1;
                 eprintln!("{}: {:?}", event.trial_name, result.status);
             }
+            EvalEventKind::Failed(failure) => {
+                completed += 1;
+                eprintln!("{}: Errored ({:?})", event.trial_name, failure.kind);
+            }
             EvalEventKind::Agent(_)
             | EvalEventKind::VerifierStarted
             | EvalEventKind::VerifierOutput { .. }

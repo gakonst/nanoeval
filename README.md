@@ -384,6 +384,24 @@ UUID-named evaluation job beneath it, and `Harbor::new(&eval)` explicitly
 attaches Harbor output to that evaluator. `record(...)` starts draining immediately;
 `finish(...)` is finalization, not deferred event conversion.
 
+For a batch that must retain errored attempts as well as scored results, finalize
+by the expected terminal count:
+
+```rust,no_run
+# use nanoeval_harbor::HarborRecorder;
+# async fn finish(harbor: HarborRecorder) -> Result<(), Box<dyn std::error::Error>> {
+let job = harbor.finish_all(15).await?;
+println!("Harbor job: {}", job.directory().display());
+# Ok(())
+# }
+```
+
+Every accepted attempt emits exactly one `Completed` or `Failed` terminal event.
+`finish_all(...)` waits for all of them, so one refusal does not cancel or hide
+unrelated trials. A refusal is retained with a partial ATIF trajectory, a null
+reward, and Harbor `exception_info` such as `AgentSafetyRefusalError`; scored
+failures remain ordinary verifier results with reward `0.0`.
+
 See [`examples/src/bin/harbor_task.rs`](examples/src/bin/harbor_task.rs):
 
 ```sh

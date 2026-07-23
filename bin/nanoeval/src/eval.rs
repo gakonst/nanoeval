@@ -137,10 +137,13 @@ impl Eval {
         let progress = tokio::spawn(report_progress(events.subscribe(), attempt_count));
         let evaluation_setup = evaluation_setup_started.elapsed();
         let attempts_started = Instant::now();
-        let results = eval.sweep(sweep).await?.into_results();
+        let (results, run_error) = match eval.sweep(sweep).await {
+            Ok(results) => (results.into_results(), None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         let attempts = attempts_started.elapsed();
         let harbor_finish_started = Instant::now();
-        let job = harbor.finish(results.clone()).await?;
+        let job = harbor.finish_all(attempt_count).await?;
         progress.await??;
         let harbor_finish = harbor_finish_started.elapsed();
         let output_started = Instant::now();
@@ -163,6 +166,9 @@ impl Eval {
             total: total_started.elapsed(),
         }
         .record(&results);
+        if let Some(error) = run_error {
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -1322,6 +1328,10 @@ async fn report_progress(mut events: NanoevalEventStream, expected: usize) -> Re
             EvalEventKind::Completed(result) => {
                 completed += 1;
                 eprintln!("{}: {:?}", event.trial_name, result.status);
+            }
+            EvalEventKind::Failed(failure) => {
+                completed += 1;
+                eprintln!("{}: Errored ({:?})", event.trial_name, failure.kind);
             }
             EvalEventKind::Agent(_)
             | EvalEventKind::VerifierStarted

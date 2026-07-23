@@ -14,6 +14,38 @@ pub enum EvalStatus {
     Failed,
 }
 
+/// Stable classification for an attempt that could not produce a score.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalFailureKind {
+    AgentSafetyRefusal,
+    AgentAuthentication,
+    AgentTimeout,
+    VerifierTimeout,
+    Agent,
+    Verifier,
+    Environment,
+    Internal,
+}
+
+/// Typed terminal output for an errored or refused attempt.
+#[derive(Clone, Debug, Serialize)]
+pub struct EvalFailure {
+    pub attempt_id: Uuid,
+    pub task_name: String,
+    pub trial_name: String,
+    pub kind: EvalFailureKind,
+    pub message: String,
+    pub traceback: String,
+    pub model: String,
+    pub effort: String,
+    pub started_at: DateTime<Utc>,
+    pub occurred_at: DateTime<Utc>,
+    pub artifacts: EvalArtifacts,
+    #[serde(skip)]
+    pub(crate) task: Task,
+}
+
 /// Typed result returned by [`crate::Nanoeval::task`].
 #[derive(Clone, Debug, Serialize)]
 pub struct EvalResult {
@@ -102,6 +134,31 @@ impl EvalResult {
     #[must_use]
     pub const fn task(&self) -> &Task {
         &self.task
+    }
+}
+
+impl EvalFailure {
+    /// The immutable task definition used by this attempt.
+    #[must_use]
+    pub const fn task(&self) -> &Task {
+        &self.task
+    }
+}
+
+impl EvalFailureKind {
+    /// Harbor's exception class for this terminal failure.
+    #[must_use]
+    pub const fn harbor_exception_type(self) -> &'static str {
+        match self {
+            Self::AgentSafetyRefusal => "AgentSafetyRefusalError",
+            Self::AgentAuthentication => "AgentAuthenticationError",
+            Self::AgentTimeout => "AgentTimeoutError",
+            Self::VerifierTimeout => "VerifierTimeoutError",
+            Self::Agent => "AgentError",
+            Self::Verifier => "VerifierError",
+            Self::Environment => "EnvironmentError",
+            Self::Internal => "NanoevalError",
+        }
     }
 }
 

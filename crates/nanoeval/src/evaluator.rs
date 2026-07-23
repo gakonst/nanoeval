@@ -13,7 +13,11 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
-use nanocodex::{AgentEvent, AgentEventKind, NanocodexBuilder, NanocodexError, StandardResponses};
+use nanocodex::{
+    AgentEvent, AgentEventKind, MODEL, NanocodexBuilder, NanocodexError, ResponsesError,
+    StandardResponses,
+};
+use serde::Deserialize;
 use tokio::{
     sync::{AcquireError, Semaphore, broadcast},
     time::timeout,
@@ -22,9 +26,9 @@ use tracing::{Instrument, Span, info, info_span};
 use uuid::Uuid;
 
 use crate::{
-    AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalResult,
-    EvalStatus, EvalTiming, NanoevalEvents, PhaseTiming, Sweep, SweepAttemptResult, SweepResults,
-    Task, VerifierResult,
+    AgentId, AgentMetadata, AgentResult, EvalArtifacts, EvalEvent, EvalEventKind, EvalFailure,
+    EvalFailureKind, EvalResult, EvalStatus, EvalTiming, NanoevalEvents, PhaseTiming, Sweep,
+    SweepAttemptResult, SweepResults, Task, VerifierResult,
     job::EvalJob,
     native::{NativeAttempt, VerifierExecution},
 };
@@ -301,8 +305,16 @@ impl Nanoeval {
             })
             .buffer_unordered(self.inner.max_concurrency);
         let mut results = Vec::new();
+        let mut first_error = None;
         while let Some((index, result)) = completed.next().await {
-            results.push((index, result?));
+            match result {
+                Ok(result) => results.push((index, result)),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         results.sort_unstable_by_key(|(index, _)| *index);
         Ok(results.into_iter().map(|(_, result)| result).collect())
@@ -351,6 +363,9 @@ impl Nanoeval {
             .fetch_add(1, Ordering::Relaxed)
             / PROMPT_CACHE_COHORT_SIZE;
         let trial_name = trial_name(&task, attempt_id, coordinate.as_ref());
+        let started_at = Utc::now();
+        let mut emitter =
+            AttemptEmitter::new(self, attempt_id, prompt_cache_cohort, &task, &trial_name);
         let span = attempt_span(
             self,
             &task,
@@ -362,10 +377,22 @@ impl Nanoeval {
         record_content(&span, "task.prompt", task.prompt());
         let trace_started = Instant::now();
         let result = self
-            .run_task_inner(task, nanocodex, attempt_id, prompt_cache_cohort, trial_name)
+            .run_task_inner(
+                task.clone(),
+                nanocodex,
+                attempt_id,
+                trial_name.clone(),
+                started_at,
+                &mut emitter,
+            )
             .instrument(span.clone())
             .await;
         record_attempt_result(&span, trace_started, &result);
+        if let Err(error) = &result {
+            emitter.emit(EvalEventKind::Failed(Box::new(attempt_failure(
+                self, attempt_id, task, trial_name, started_at, error,
+            ))));
+        }
         result.map(|result| AttemptOutput { result, coordinate })
     }
 
@@ -374,10 +401,10 @@ impl Nanoeval {
         task: Task,
         nanocodex: NanocodexBuilder<StandardResponses>,
         attempt_id: Uuid,
-        prompt_cache_cohort: u64,
         trial_name: String,
+        started_at: DateTime<Utc>,
+        emitter: &mut AttemptEmitter<'_>,
     ) -> Result<EvalResult, EvalError> {
-        let started_at = Utc::now();
         let attempt = {
             let span = info_span!(
                 target: "nanoeval",
@@ -398,14 +425,12 @@ impl Nanoeval {
             record_span_result(&span, trace_started, &result);
             result?
         };
-        let mut emitter =
-            AttemptEmitter::new(self, attempt_id, prompt_cache_cohort, &task, &trial_name);
         emitter.emit(EvalEventKind::AttemptStarted {
             prompt: task.prompt().to_owned(),
             workspace: attempt.paths.workspace.clone(),
         });
         let mut agent = self
-            .execute_agent(&mut emitter, &task, &attempt, nanocodex)
+            .execute_agent(emitter, &task, &attempt, nanocodex)
             .await?;
 
         emitter.emit(EvalEventKind::VerifierStarted);
@@ -772,6 +797,94 @@ impl<'a> AttemptEmitter<'a> {
     }
 }
 
+#[derive(Deserialize)]
+struct ResponsesApiErrorEnvelope {
+    error: ResponsesApiError,
+}
+
+#[derive(Deserialize)]
+struct ResponsesApiError {
+    code: Option<String>,
+}
+
+fn attempt_failure(
+    eval: &Nanoeval,
+    attempt_id: Uuid,
+    task: Task,
+    trial_name: String,
+    started_at: DateTime<Utc>,
+    error: &EvalError,
+) -> EvalFailure {
+    let root = eval.directory().join(&trial_name);
+    EvalFailure {
+        attempt_id,
+        task_name: task.name().to_owned(),
+        trial_name,
+        kind: failure_kind(error),
+        message: error.to_string(),
+        traceback: error_traceback(error),
+        model: MODEL.to_owned(),
+        effort: "unknown".to_owned(),
+        started_at,
+        occurred_at: Utc::now(),
+        artifacts: EvalArtifacts {
+            workspace: root.join("workspace"),
+            verifier_output: root.join("verifier/test-stdout.txt"),
+            directory: root,
+        },
+        task,
+    }
+}
+
+fn failure_kind(error: &EvalError) -> EvalFailureKind {
+    match error {
+        EvalError::Nanocodex(error) if is_safety_refusal(error) => {
+            EvalFailureKind::AgentSafetyRefusal
+        }
+        EvalError::Nanocodex(error)
+            if error
+                .responses_error()
+                .is_some_and(|error| error.class() == "authorization") =>
+        {
+            EvalFailureKind::AgentAuthentication
+        }
+        EvalError::AgentTimeout(_) => EvalFailureKind::AgentTimeout,
+        EvalError::VerifierTimeout(_) => EvalFailureKind::VerifierTimeout,
+        EvalError::Nanocodex(_) | EvalError::AgentEventsClosed => EvalFailureKind::Agent,
+        EvalError::AttemptVerifier(_) | EvalError::ParseReward(_) => EvalFailureKind::Verifier,
+        EvalError::UnsupportedNativeTask { .. }
+        | EvalError::UnsupportedEnvironmentEntry(_)
+        | EvalError::AttemptAgent(_) => EvalFailureKind::Environment,
+        EvalError::InvalidConcurrency
+        | EvalError::Io(_)
+        | EvalError::Json(_)
+        | EvalError::RunConflict(_)
+        | EvalError::ConcurrencyClosed(_)
+        | EvalError::MissingSweepCoordinate => EvalFailureKind::Internal,
+    }
+}
+
+fn is_safety_refusal(error: &NanocodexError) -> bool {
+    let Some(ResponsesError::Api { event }) = error.responses_error() else {
+        return false;
+    };
+    serde_json::from_str::<ResponsesApiErrorEnvelope>(event)
+        .ok()
+        .and_then(|event| event.error.code)
+        .is_some_and(|code| code == "cyber_policy")
+}
+
+fn error_traceback(error: &dyn Error) -> String {
+    let mut traceback = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        traceback.push_str("\nCaused by: ");
+        traceback.push_str(&error.to_string());
+        source = error.source();
+    }
+    traceback
+}
+
 fn attempt_span(
     eval: &Nanoeval,
     task: &Task,
@@ -1030,15 +1143,15 @@ mod tracing_tests {
         sync::{Arc, Mutex},
     };
 
-    use nanocodex::Nanocodex;
+    use nanocodex::{Nanocodex, NanocodexError, ResponsesError};
     use tempfile::tempdir;
     use tracing::{Id, Instrument, Subscriber, field::Visit, span::Attributes};
     use tracing_subscriber::{
         Layer, layer::Context as LayerContext, prelude::*, registry::LookupSpan,
     };
 
-    use super::{EvalError, Nanoeval};
-    use crate::Task;
+    use super::{EvalError, Nanoeval, failure_kind};
+    use crate::{EvalFailureKind, Task};
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
@@ -1100,7 +1213,7 @@ mod tracing_tests {
     }
 
     #[test]
-    fn attempt_is_a_root_with_a_timed_failure_phase() {
+    fn failed_attempt_does_not_cancel_pending_batch_work() {
         let task_root = tempdir().unwrap();
         fs::create_dir(task_root.path().join("tests")).unwrap();
         fs::create_dir(task_root.path().join("environment")).unwrap();
@@ -1149,7 +1262,7 @@ allow_internet = false
                     .build()
                     .unwrap();
                 let result = eval
-                    .task(task)
+                    .tasks(vec![task.clone(), task])
                     .instrument(tracing::info_span!("test.parent"))
                     .await;
                 assert!(matches!(
@@ -1160,25 +1273,44 @@ allow_internet = false
         });
 
         let spans = capture.0.lock().unwrap();
-        let (attempt_id, attempt) = spans
+        let attempts = spans
             .iter()
-            .find(|(_, span)| span.name == "eval.attempt")
-            .unwrap();
-        assert!(attempt.parent.is_none());
-        assert_eq!(
-            attempt.fields.get("status").map(String::as_str),
-            Some("failed")
-        );
-        assert!(attempt.fields.contains_key("duration_ns"));
-        let setup = spans
+            .filter(|(_, span)| span.name == "eval.attempt")
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2);
+        for (_, attempt) in &attempts {
+            assert!(attempt.parent.is_none());
+            assert_eq!(
+                attempt.fields.get("status").map(String::as_str),
+                Some("failed")
+            );
+            assert!(attempt.fields.contains_key("duration_ns"));
+        }
+        let setups = spans
             .values()
-            .find(|span| span.name == "eval.environment.setup")
-            .unwrap();
-        assert_eq!(setup.parent, Some(*attempt_id));
-        assert_eq!(
-            setup.fields.get("status").map(String::as_str),
-            Some("failed")
-        );
-        assert!(setup.fields.contains_key("duration_ns"));
+            .filter(|span| span.name == "eval.environment.setup")
+            .collect::<Vec<_>>();
+        assert_eq!(setups.len(), 2);
+        for setup in setups {
+            assert!(
+                attempts
+                    .iter()
+                    .any(|(attempt_id, _)| setup.parent == Some(**attempt_id))
+            );
+            assert_eq!(
+                setup.fields.get("status").map(String::as_str),
+                Some("failed")
+            );
+            assert!(setup.fields.contains_key("duration_ns"));
+        }
+    }
+
+    #[test]
+    fn classifies_cyber_policy_as_an_agent_safety_refusal() {
+        let error = EvalError::Nanocodex(NanocodexError::Responses(ResponsesError::Api {
+            event: r#"{"type":"error","error":{"code":"cyber_policy"}}"#.to_owned(),
+        }));
+
+        assert_eq!(failure_kind(&error), EvalFailureKind::AgentSafetyRefusal);
     }
 }

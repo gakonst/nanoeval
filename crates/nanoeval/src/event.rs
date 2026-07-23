@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::{EvalResult, VerifierResult};
+use crate::{EvalFailure, EvalResult, VerifierResult};
 
 /// One event from a possibly concurrent Nanoeval attempt.
 #[derive(Clone, Debug, Serialize)]
@@ -29,6 +29,7 @@ pub enum EvalEventKind {
     VerifierOutput { stdout: String, stderr: String },
     VerifierCompleted(VerifierResult),
     Completed(Box<EvalResult>),
+    Failed(Box<EvalFailure>),
 }
 
 /// Cloneable source of independent subscriptions to one evaluation job.

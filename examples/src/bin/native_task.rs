@@ -20,7 +20,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut count = 0_u64;
         while let Some(event) = event_stream.recv().await? {
             count += 1;
-            if matches!(event.kind, EvalEventKind::Completed(_)) {
+            if matches!(
+                event.kind,
+                EvalEventKind::Completed(_) | EvalEventKind::Failed(_)
+            ) {
                 break;
             }
         }

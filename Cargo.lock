@@ -2139,6 +2139,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ignore",
+ "nanocodex",
  "nanoeval",
  "serde",
  "serde_json",

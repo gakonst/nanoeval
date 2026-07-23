@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use nanocodex::{AgentEvent, AgentEventKind, Usage};
+use nanocodex::{AgentEvent, AgentEventKind, MODEL, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -166,7 +166,7 @@ pub struct AtifFinalMetricsExtra {
     pub runtime: AtifRuntimeMetrics,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AtifRuntimeMetrics {
     pub connection_attempts: u32,
     pub websocket_reconnects: u32,
@@ -337,6 +337,80 @@ impl AtifBuilder {
             },
         }
     }
+
+    /// Finishes the partial trajectory observed before an attempt error.
+    #[must_use]
+    pub fn finish_failure(self, task: &Task) -> AtifTrajectory {
+        let model_name = self
+            .turns
+            .values()
+            .find_map(|turn| turn.model_name.clone())
+            .unwrap_or_else(|| MODEL.to_owned());
+        let prompt_tokens = self
+            .turns
+            .values()
+            .filter_map(|turn| turn.metrics.as_ref())
+            .map(|metrics| metrics.prompt_tokens)
+            .sum();
+        let completion_tokens = self
+            .turns
+            .values()
+            .filter_map(|turn| turn.metrics.as_ref())
+            .map(|metrics| metrics.completion_tokens)
+            .sum();
+        let cached_tokens = self
+            .turns
+            .values()
+            .filter_map(|turn| turn.metrics.as_ref())
+            .map(|metrics| metrics.cached_tokens)
+            .sum();
+        let duration_ns = self
+            .turns
+            .values()
+            .filter_map(|turn| turn.metrics.as_ref())
+            .map(|metrics| metrics.extra.duration_ns)
+            .sum();
+        let model_calls = u32::try_from(self.turns.len()).unwrap_or(u32::MAX);
+        let tool_calls = self
+            .turns
+            .values()
+            .map(|turn| turn.tool_calls.len())
+            .sum::<usize>();
+        let mut steps = Vec::with_capacity(self.turns.len() + 1);
+        steps.push(AtifStep::user(1, task.prompt()));
+        for (offset, turn) in self.turns.into_values().enumerate() {
+            let step_id = u32::try_from(offset + 2).unwrap_or(u32::MAX);
+            steps.push(turn.into_failure_step(step_id));
+        }
+        let total_steps = u32::try_from(steps.len()).unwrap_or(u32::MAX);
+        AtifTrajectory {
+            schema_version: AtifSchemaVersion::V1_7,
+            session_id: self.session_id.unwrap_or_default(),
+            agent: AtifAgent {
+                name: "nanocodex".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                model_name,
+                extra: AtifAgentExtra {
+                    transport: "responses_websocket_v2".to_owned(),
+                    orchestration: "local_code_mode".to_owned(),
+                },
+            },
+            steps,
+            final_metrics: AtifFinalMetrics {
+                total_prompt_tokens: prompt_tokens,
+                total_completion_tokens: completion_tokens,
+                total_cached_tokens: cached_tokens,
+                total_cost_usd: None,
+                total_steps,
+                extra: AtifFinalMetricsExtra {
+                    model_calls,
+                    tool_calls: u32::try_from(tool_calls).unwrap_or(u32::MAX),
+                    duration_ns,
+                    runtime: AtifRuntimeMetrics::default(),
+                },
+            },
+        }
+    }
 }
 
 impl AtifTurn {
@@ -348,6 +422,24 @@ impl AtifTurn {
             reasoning_effort: self
                 .reasoning_effort
                 .or_else(|| Some(result.effort.clone())),
+            message: self.message,
+            reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            tool_calls: (!self.tool_calls.is_empty()).then_some(self.tool_calls),
+            observation: (!self.observations.is_empty()).then_some(AtifObservation {
+                results: self.observations,
+            }),
+            metrics: self.metrics,
+            llm_call_count: Some(1),
+            extra: None,
+        }
+    }
+
+    fn into_failure_step(self, step_id: u32) -> AtifStep {
+        AtifStep {
+            step_id,
+            source: AtifSource::Agent,
+            model_name: self.model_name,
+            reasoning_effort: self.reasoning_effort,
             message: self.message,
             reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
             tool_calls: (!self.tool_calls.is_empty()).then_some(self.tool_calls),
