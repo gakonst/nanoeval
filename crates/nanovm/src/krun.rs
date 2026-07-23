@@ -16,6 +16,14 @@ const ROOT_BLOCK_DEVICE: &std::ffi::CStr = c"/dev/vda";
 const EXT4_FILESYSTEM: &std::ffi::CStr = c"ext4";
 const ROOT_MOUNT_OPTIONS: &std::ffi::CStr = c"rw";
 const TSI_HIJACK_INET: u32 = 1;
+const NET_FLAG_VFKIT: u32 = 1 << 0;
+const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
+const NET_FEATURE_CSUM: u32 = 1 << 0;
+const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
+const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
+const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
+const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
+const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
 
 #[derive(Debug, Error)]
 pub enum VmError {
@@ -24,6 +32,9 @@ pub enum VmError {
 
     #[error("failed to resolve root filesystem {path}: {source}")]
     ResolveRoot { path: PathBuf, source: io::Error },
+
+    #[error("failed to resolve network socket {path}: {source}")]
+    ResolveNetworkSocket { path: PathBuf, source: io::Error },
 
     #[error("root filesystem is not a directory: {0}")]
     RootNotDirectory(PathBuf),
@@ -166,12 +177,7 @@ impl KrunVm {
             "attach console",
         )?;
 
-        if config.network_value() == Network::Internet {
-            check(
-                krun::krun_add_vsock(context, TSI_HIJACK_INET),
-                "enable TSI networking",
-            )?;
-        }
+        attach_network(context, config.network_value())?;
         check(
             krun::krun_split_irqchip(context, false),
             "configure interrupt controller",
@@ -260,6 +266,54 @@ impl KrunVm {
         Err(VmError::UnexpectedReturn)
     }
 }
+
+fn attach_network(context: u32, network: &Network) -> Result<(), VmError> {
+    match network {
+        Network::Disabled => {}
+        Network::Internet => {
+            check(
+                krun::krun_add_vsock(context, TSI_HIJACK_INET),
+                "enable TSI networking",
+            )?;
+        }
+        Network::Gvproxy {
+            socket,
+            mac_address,
+        } => {
+            let socket = socket
+                .canonicalize()
+                .map_err(|source| VmError::ResolveNetworkSocket {
+                    path: socket.clone(),
+                    source,
+                })?;
+            let socket = c_string(socket.as_os_str(), "gvproxy socket path")?;
+            let mut mac_address = *mac_address;
+            check(
+                // SAFETY: the socket string and MAC array remain alive for the
+                // call and libkrun copies both into its configuration.
+                unsafe {
+                    krun::krun_add_net_unixgram(
+                        context,
+                        socket.as_ptr(),
+                        -1,
+                        mac_address.as_mut_ptr(),
+                        COMPATIBLE_NETWORK_FEATURES,
+                        NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT,
+                    )
+                },
+                "attach gvproxy network",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+const COMPATIBLE_NETWORK_FEATURES: u32 = NET_FEATURE_CSUM
+    | NET_FEATURE_GUEST_CSUM
+    | NET_FEATURE_GUEST_TSO4
+    | NET_FEATURE_GUEST_UFO
+    | NET_FEATURE_HOST_TSO4
+    | NET_FEATURE_HOST_UFO;
 
 fn attach_block_devices(context: u32, devices: &[BlockDevice]) -> Result<(), VmError> {
     for device in devices {

@@ -122,6 +122,15 @@ ext4 template and mounts the current runtime as a read-only block disk.
 Consequently, ordinary harness or tool changes require only a Rust rebuild and
 VM restart, not an OCI pull or task-image rebuild.
 
+The writable attempt disk is retained when an agent is refused, the harness
+errors, or verification fails, so `nanoeval inspect` can point directly at the
+guest filesystem that needs diagnosis. Passed attempts remove that large CoW
+disk after same-guest verification and retain the Harbor result, ATIF
+trajectory, exact event stream, verifier output, CTRF, answer, stderr, and
+network log. This keeps full-suite runs bounded without weakening failure
+evidence. Pass `--vm-retention all` when a successful guest disk is itself the
+artifact under investigation.
+
 In a source checkout, `nanoeval run --vm` incrementally builds the static
 Linux/aarch64 guest runtime with Cargo, stages only that content-addressed
 binary under `.cache/vm/runtimes`, and exposes no source tree or general target
@@ -132,12 +141,22 @@ content-addressed, entitled copy of the host binary. Cargo may replace its
 ordinary output with an unsigned linker artifact without invalidating the
 signed copy or causing a broken VMM child.
 
+Each attempt also receives its own gvproxy-backed virtio-net interface. Nanoeval
+downloads the pinned, checksummed gvproxy release once into `.cache/vm` (or uses
+`NANOEVAL_GVPROXY`/`PATH`) and owns that process for exactly the guest lifetime.
+Guest loopback and listening ports are therefore private per attempt; concurrent
+tasks may both bind `localhost:8080` without reaching each other or a host
+service.
+
 Prepare one or more Terminal-Bench 2.1 environments without running agents:
 
 ```sh
 cargo run -- vm prepare \
   --task /path/to/terminal-bench-2-1/count-dataset-tokens \
   --task /path/to/terminal-bench-2-1/regex-log
+
+# Prepare every immediate task in a suite.
+cargo run -- vm prepare --suite /path/to/terminal-bench-2-1
 ```
 
 Preparation writes one root-disk path to stdout per task in input order and
@@ -160,6 +179,20 @@ cargo run -- run \
   --thinking low \
   --vm
 ```
+
+Run a complete suite without expanding 89 `--task` flags:
+
+```sh
+cargo run -- run \
+  --suite /path/to/terminal-bench-2-1 \
+  --trials 1 \
+  --concurrency 16 \
+  --thinking low \
+  --vm
+```
+
+`--suite` selects immediate child directories containing `task.toml` in stable
+name order. It may be combined with explicit, repeated `--task` inputs.
 
 Every `--task` is one eval and `--trials` applies to each one. Run the complete
 three-eval, `k=5` suite with:
@@ -601,33 +634,27 @@ seconds cold and 2.784 seconds warm. The cache must remain a post-agent layer:
 baking it into the task image would expose curl, uv, pytest, package metadata,
 and different command behavior to the agent before Harbor would.
 
-The VM lifecycle now has the required phase boundary: after the agent turn, a
-typed control request runs guest `sync`, acknowledges it over the console, and
-waits for the VMM child to exit successfully. Nanoeval then boots a fresh
-verifier guest from an APFS CoW clone of the complete mutated ext4 disk and
-shuts that guest down through the same path after collecting artifacts. A real
-two-boot disk check retained a guest-written file across the boundary. This
-costs one roughly 0.2-second boot and ensures no live agent process, verifier
-mutation, or stale buffered write crosses the phase boundary.
+The verifier runs in the same live guest as the agent. Nanoeval withholds
+`/tests` during agent work, injects the canonical verifier directory only after
+the agent turn completes, executes it through the trusted typed console, reads
+reward/CTRF/answer artifacts, then synchronizes and shuts down the guest. This
+is required for service tasks: SSH, Nginx, PyPI, nested QEMU, VNC, monitor
+sockets, and other agent-started processes remain alive for verification.
 
-The warm path now preserves the post-agent disk, clones it for verification,
-and attaches a content-addressed, private CoW ext4 dependency disk. No verifier
-cache directory is exposed from the host through virtiofs. The dependency key
-includes the base ext4 identity, architecture, complete verifier script, disk
-geometry, and cache builder version. Unknown verifier shapes keep executing
-cold. A miss runs the byte-for-byte canonical script and atomically publishes a
-cache only after the pinned uv installation exists. A hit starts the same
-untouched script at its recognized post-bootstrap byte boundary, after sourcing
-the cached uv environment; the task-owned test and reward logic is unchanged.
-Each hit receives a private CoW clone, so concurrent trials never share writable
-package state. The private cache disk is deleted after successful artifact
-collection; the content-addressed cache remains, while retained jobs keep only
-the mutated task/verifier roots and Harbor evidence.
+Verifier dependencies remain a separate content-addressed ext4 cache. The
+dependency key includes the base ext4 identity, architecture, complete verifier
+script, disk geometry, and cache builder version. A private CoW clone is
+attached at initial boot but mounted only after the agent phase. Unknown
+verifier shapes execute cold. A miss runs the byte-for-byte canonical script
+and atomically publishes the cache only after the pinned uv installation
+exists; a hit starts the same script at its recognized post-bootstrap byte
+boundary. The task-owned test and reward logic is unchanged, and concurrent
+trials never share writable package state.
 
 `regex-log` supplied the second canonical task proof and a different base image,
 `ubuntu:24.04`. Direct OCI images leave `/etc/resolv.conf` for the container
-runtime to inject, so Nanoeval now copies only validated host nameserver IPs into
-each ext4 guest before starting its runtime. The untouched task passed twice
+runtime to inject, so Nanoeval points each guest at its private gvproxy DNS
+gateway before starting its runtime. The untouched task passed twice
 with reward `1`, one passing CTRF test, six ATIF-v1.7 steps, and four tool-bearing
 steps. The original directory-cache hit took 7.695 seconds while reinstalling
 curl and uv. With the final task-sized cache geometry, the private block-cache
@@ -732,6 +759,23 @@ agree with Harbor.
 Harbor remains an output and inspection boundary; its Python runtime and Docker
 executor are not dependencies of an attempt.
 
+Use the typed inspector to turn a retained job into a failure census, then drill
+into one exact trial:
+
+```sh
+cargo run -- inspect nanoeval-runs/<job-id>
+cargo run -- inspect nanoeval-runs/<job-id> --trial nginx-request-logging
+cargo run -- inspect nanoeval-runs/<job-id> --trial nginx-request-logging --full
+cargo run -- inspect nanoeval-runs/<job-id> --json
+```
+
+The job view lists pass/fail/error status and failed CTRF tests. The trial view
+adds exact assertion messages and traces, the final agent response, phase
+timings, token/cache measurements, exception/refusal details, and paths to the
+result, ATIF trajectory, exact JSONL, verifier output, network log, and retained
+CoW root disk. `--full` inlines verifier stdout, agent stderr, and gvproxy logs;
+`--json` emits the same report as strict typed JSON.
+
 ## How fast?
 
 On the same `write-greeting` task, model, effort, and tool configuration on an
@@ -777,19 +821,21 @@ The native backend is complete for compatible tasks. It is deliberately fast
 and deliberately not a security boundary: task commands start in the attempt
 workspace but otherwise execute as ordinary host processes.
 
-The experimental VM path embeds libkrun from its upstream `main` branch. On
-macOS it uses Hypervisor.framework; on Linux it uses KVM. The current spike can
-boot an ARM64 Linux root filesystem and run one command:
+The VM path embeds libkrun from its upstream `main` branch. On macOS it uses
+Hypervisor.framework; on Linux it uses KVM. OCI/Dockerfile preparation produces
+immutable ARM64 ext4 templates; every attempt reflinks one private writable root
+disk, boots one guest, and routes the exact standard Nanocodex workspace tools
+through its typed console:
 
 ```sh
 cargo run -- vm run --root /path/to/rootfs -- /bin/uname -a
 ```
 
-The intended scored backend is a small pool of warm Linux workers. Each worker
-will materialize OCI inputs without Docker and run many attempts concurrently,
-with a private OverlayFS, namespaces, cgroup, and process tree per attempt. The
-Nanocodex harness remains outside the untrusted task sandbox while its standard
-tools target that sandbox.
+The Nanocodex harness remains outside the untrusted task guest while its
+standard tools target that guest. Verification stays in the same live guest,
+but tests remain hidden until the agent phase ends. Each attempt owns a private
+CoW disk, VMM process, guest process tree, loopback namespace, and gvproxy
+network stack.
 
 See [`PLAN.md`](PLAN.md) for the ordered implementation plan,
 [`HARNESS_PLACEMENT.md`](HARNESS_PLACEMENT.md) for the measured harness-placement
@@ -802,6 +848,7 @@ tool seam.
 # Inspect the command surface.
 cargo run -- --help
 cargo run -- run --help
+cargo run -- inspect --help
 
 # Load and validate a task without running an agent.
 cargo run -- task tasks/write-greeting

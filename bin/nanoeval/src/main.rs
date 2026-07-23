@@ -1,7 +1,9 @@
 mod config;
 mod eval;
+mod inspect;
 mod observability;
 mod vm_image;
+mod vm_network;
 
 use std::{
     collections::BTreeMap,
@@ -14,7 +16,7 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand};
 use eyre::{Result, eyre};
 use nanoeval::Task;
-use nanovm::{BlockDevice, GuestCommand, KrunVm, SharedDirectory, VmConfig};
+use nanovm::{BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -47,6 +49,9 @@ enum Command {
         prompt: bool,
     },
 
+    /// Explain a retained Harbor job or trial and surface exact failure evidence.
+    Inspect(inspect::Inspect),
+
     /// Run one command in a libkrun microVM.
     Vm {
         #[command(subcommand)]
@@ -59,8 +64,20 @@ enum VmCommand {
     /// Prepare one or more tasks' Linux/ARM64 root disks without running agents.
     Prepare {
         /// Terminal-Bench task directory. Repeat to prepare several environments.
-        #[arg(long = "task", required = true, value_name = "DIRECTORY")]
+        #[arg(
+            long = "task",
+            value_name = "DIRECTORY",
+            required_unless_present = "suites"
+        )]
         tasks: Vec<PathBuf>,
+
+        /// Terminal-Bench suite directory whose immediate task children should prepare.
+        #[arg(
+            long = "suite",
+            value_name = "DIRECTORY",
+            required_unless_present = "tasks"
+        )]
+        suites: Vec<PathBuf>,
 
         /// Content-addressed VM cache directory.
         #[arg(long, default_value = ".cache/vm")]
@@ -88,6 +105,10 @@ enum VmCommand {
         /// Guest memory in MiB.
         #[arg(long, default_value_t = 1024)]
         memory_mib: u32,
+
+        /// Gvproxy unixgram socket used for an isolated virtio-net interface.
+        #[arg(long, value_name = "SOCKET")]
+        network_socket: Option<PathBuf>,
 
         /// Read-only directory containing the guest tool runtime.
         #[arg(long, value_name = "DIRECTORY")]
@@ -214,6 +235,7 @@ enum GuestEnvironmentParseError {
 
 fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+    enable_paint();
     let cli = Cli::parse();
 
     if let Some(Command::Vm {
@@ -223,6 +245,7 @@ fn main() -> Result<()> {
                 ext4,
                 cpus,
                 memory_mib,
+                network_socket,
                 runtime_directory,
                 writable_share,
                 read_only_disk,
@@ -237,6 +260,7 @@ fn main() -> Result<()> {
             ext4: *ext4,
             cpus: *cpus,
             memory_mib: *memory_mib,
+            network_socket: network_socket.as_deref(),
             runtime_directory: runtime_directory.as_deref(),
             writable_shares: writable_share,
             read_only_disks: read_only_disk,
@@ -252,12 +276,18 @@ fn main() -> Result<()> {
         .block_on(run(cli))
 }
 
+fn enable_paint() {
+    let enable = yansi::Condition::os_support() && yansi::Condition::tty_and_color_live();
+    yansi::whenever(yansi::Condition::cached(enable));
+}
+
 #[derive(Clone, Copy)]
 struct RunVm<'a> {
     root: &'a Path,
     ext4: bool,
     cpus: u8,
     memory_mib: u32,
+    network_socket: Option<&'a Path>,
     runtime_directory: Option<&'a Path>,
     writable_shares: &'a [WritableShare],
     read_only_disks: &'a [ReadOnlyDisk],
@@ -278,6 +308,9 @@ fn run_vm(input: RunVm<'_>) -> Result<()> {
     }
     .cpus(input.cpus)
     .memory_mib(input.memory_mib);
+    if let Some(socket) = input.network_socket {
+        config = config.network(Network::gvproxy(socket));
+    }
     if let Some(directory) = input.runtime_directory {
         config = config.shared_directory(SharedDirectory::read_only("nanoeval-tools", directory));
     }
@@ -301,9 +334,14 @@ fn run_vm(input: RunVm<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn prepare_tasks(tasks: Vec<PathBuf>, cache: PathBuf, refresh: bool) -> Result<()> {
+async fn prepare_tasks(
+    tasks: Vec<PathBuf>,
+    suites: Vec<PathBuf>,
+    cache: PathBuf,
+    refresh: bool,
+) -> Result<()> {
     let preparation_started = Instant::now();
-    let tasks = tasks
+    let tasks = eval::load_task_paths(tasks, suites)?
         .into_iter()
         .map(Task::load)
         .collect::<Result<Vec<_>, _>>()?;
@@ -321,9 +359,22 @@ async fn prepare_tasks(tasks: Vec<PathBuf>, cache: PathBuf, refresh: bool) -> Re
     let builder = vm_image::VmImageBuilder::new(vmm, runtime_image, ".cache/libkrunfw/libkrunfw");
     let mut cache_hits = 0_usize;
     let mut cache_creations = 0_usize;
+    let mut failures = Vec::new();
     for task in tasks {
         let task_started = Instant::now();
-        let prepared = vm_image::PreparedRootDisk::prepare(&task, &cache, policy, &builder).await?;
+        let prepared =
+            match vm_image::PreparedRootDisk::prepare(&task, &cache, policy, &builder).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    eprintln!(
+                        "{}: failed duration={:.3?}\n{error:#}",
+                        task.name(),
+                        task_started.elapsed()
+                    );
+                    failures.push(task.name().to_owned());
+                    continue;
+                }
+            };
         match prepared.disk_status() {
             vm_image::DiskStatus::Hit => cache_hits += 1,
             vm_image::DiskStatus::Created => cache_creations += 1,
@@ -339,11 +390,20 @@ async fn prepare_tasks(tasks: Vec<PathBuf>, cache: PathBuf, refresh: bool) -> Re
         println!("{}", prepared.path().display());
     }
     eprintln!(
-        "VM preparation: runtime={runtime_duration:.3?} environments={} hits={cache_hits} created={cache_creations} total={:.3?}",
+        "VM preparation: runtime={runtime_duration:.3?} environments={} hits={cache_hits} created={cache_creations} failed={} total={:.3?}",
         cache_hits + cache_creations,
+        failures.len(),
         preparation_started.elapsed()
     );
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "{} VM environment(s) failed preparation: {}",
+            failures.len(),
+            failures.join(", ")
+        ))
+    }
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -371,14 +431,16 @@ async fn run(cli: Cli) -> Result<()> {
                 output.write_human(&mut stdout, prompt)?;
             }
         }
+        Command::Inspect(command) => command.run()?,
         Command::Vm {
             command:
                 VmCommand::Prepare {
                     tasks,
+                    suites,
                     cache,
                     refresh,
                 },
-        } => prepare_tasks(tasks, cache, refresh).await?,
+        } => prepare_tasks(tasks, suites, cache, refresh).await?,
         Command::Vm {
             command:
                 VmCommand::Run {
@@ -386,6 +448,7 @@ async fn run(cli: Cli) -> Result<()> {
                     ext4,
                     cpus,
                     memory_mib,
+                    network_socket,
                     runtime_directory,
                     writable_share,
                     read_only_disk,
@@ -399,6 +462,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ext4,
                 cpus,
                 memory_mib,
+                network_socket: network_socket.as_deref(),
                 runtime_directory: runtime_directory.as_deref(),
                 writable_shares: &writable_share,
                 read_only_disks: &read_only_disk,
@@ -549,5 +613,20 @@ mod tests {
                 Path::new("tasks/second").to_path_buf()
             ]
         );
+    }
+
+    #[test]
+    fn prepare_accepts_a_complete_suite() {
+        let cli =
+            Cli::try_parse_from(["nanoeval", "vm", "prepare", "--suite", "terminal-bench-2-1"])
+                .unwrap();
+        let Some(Command::Vm {
+            command: VmCommand::Prepare { suites, .. },
+        }) = cli.command
+        else {
+            panic!("expected vm prepare command");
+        };
+
+        assert_eq!(suites, [Path::new("terminal-bench-2-1").to_path_buf()]);
     }
 }
