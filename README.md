@@ -79,7 +79,6 @@ attempts concurrently with:
 cargo run -- run \
   --task tasks/write-greeting \
   --trials 5 \
-  --concurrency 5 \
   --thinking low
 ```
 
@@ -89,7 +88,6 @@ Run the same evaluator with workspace tools inside independent libkrun VMs:
 cargo run -- run \
   --task tasks/write-greeting \
   --trials 5 \
-  --concurrency 5 \
   --thinking low \
   --vm \
   --vm-rootfs .cache/rootfs/alpine-3.24.1
@@ -175,7 +173,6 @@ cargo run -- run \
   --task /path/to/task-b \
   --task /path/to/task-c \
   --trials 5 \
-  --concurrency 15 \
   --thinking low \
   --vm
 ```
@@ -185,23 +182,29 @@ Run a complete suite without expanding 89 `--task` flags:
 ```sh
 cargo run -- run \
   --suite /path/to/terminal-bench-2-1 \
-  --trials 1 \
-  --concurrency 8 \
-  --max-memory-mb 24576 \
+  --trials 5 \
   --thinking low \
   --vm
 ```
 
 `--suite` selects immediate child directories containing `task.toml` in stable
 name order. It may be combined with explicit, repeated `--task` inputs.
+By default, Nanoeval detects the host's available logical CPUs and physical
+memory and gives the scheduler 80% of each. On a 10-core, 32 GiB host this
+means eight concurrent attempts and a 26,214 MiB task-declared memory budget.
+`--host-utilization <PERCENT>` changes both automatic limits;
+`--concurrency` and `--max-memory-mb` override either limit independently.
+The resolved values are retained with the job, so an interrupted run resumes
+with the exact same policy even if host conditions later change.
+
 Execution is prioritized by the median duration of matching retained trials,
 falling back to declared task timeouts when no trustworthy history exists.
 Results and trial numbers remain deterministic; only dispatch order changes.
-`--max-memory-mb` is an optional job-wide admission ceiling over each task's
-declared guest memory. Slot and memory permits are acquired atomically; a
-smaller task may proceed when an earlier large task does not fit, and a task
-larger than the ceiling runs alone rather than deadlocking. Omitting the option
-retains the simple concurrency-only policy.
+The memory limit is a job-wide admission ceiling over each task's declared
+guest memory. Slot and memory permits are acquired atomically. As soon as one
+attempt finishes, its permits are released and the next candidate that fits
+starts immediately. A smaller task may proceed when an earlier large task does
+not fit, and a task larger than the ceiling runs alone rather than deadlocking.
 
 The default CLI lifecycle is interruption-safe. Before starting a new job,
 Nanoeval reopens the newest incomplete job whose typed `run.json` exactly
@@ -214,7 +217,6 @@ Ctrl+C is restarted with a fresh Nanocodex session and CoW disk:
 cargo run -- run \
   --suite /path/to/terminal-bench-2-1 \
   --trials 1 \
-  --concurrency 6 \
   --thinking low \
   --vm
 
@@ -222,7 +224,6 @@ cargo run -- run \
 cargo run -- run \
   --suite /path/to/terminal-bench-2-1 \
   --trials 1 \
-  --concurrency 6 \
   --thinking low \
   --vm
 ```
@@ -278,6 +279,33 @@ repeated; the completed source job is never mutated. Filtered retries form a
 typed lineage: each child result replaces that task's prior status, while
 unselected failures remain in the effective queue. A passing retry therefore
 removes one task without hiding its unresolved siblings.
+
+Compare a failure with successful attempts in Harbor's public Terminal-Bench
+archive:
+
+```sh
+cargo run -- compare configure-git-webserver
+
+# Rank exact task-revision matches first.
+cargo run -- compare configure-git-webserver \
+  --checksum 84d7c2fd653dad4307c7d2e9dd4f937ecbcd7ad4d1acf5d2b74c35166634178e
+
+# Narrow by harness, agent, or model and retain complete observations.
+cargo run -- compare configure-git-webserver \
+  --agent terminus \
+  --limit 3 \
+  --full
+```
+
+The first lookup creates a metadata-only Git index and downloads matching
+published result blobs. Nanoeval then stores typed per-task manifests under
+`.cache/nanoeval/published`; unchanged repeat queries avoid the network and
+large archive-tree scan. Output labels checksum mismatches explicitly. A
+published pass may have only a Harbor result, while submissions that retained
+ATIF also show their ordered messages, tool calls, and optionally complete
+reasoning and observations. `--json` returns the same typed library result
+without the human projection, and `--refresh` checks for a newer archive
+revision.
 
 Every `--task` is one eval and `--trials` applies to each one. Run the complete
 three-eval, `k=5` suite with:

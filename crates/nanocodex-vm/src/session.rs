@@ -8,9 +8,14 @@ use std::{
 use nanocodex_tools::{
     StandardTool, ToolContext, ToolExecution, ToolInput, ToolResult, ToolRuntime,
 };
+use nix::{
+    errno::Errno,
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
 };
@@ -672,9 +677,12 @@ async fn execute_guest_command(request: ExecuteRequest) -> ExecuteResponse {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
     let timeout = Duration::from_millis(request.timeout_millis);
-    match tokio::time::timeout(timeout, command.output()).await {
-        Ok(Ok(output)) => ExecuteResponse {
+    match execute_command_to_output(&mut command, timeout).await {
+        Ok(Some(output)) => ExecuteResponse {
             id: request.id,
             exit_code: Some(output.status.code().unwrap_or(1)),
             stdout: Some(output.stdout),
@@ -682,15 +690,7 @@ async fn execute_guest_command(request: ExecuteRequest) -> ExecuteResponse {
             error: None,
             timed_out: false,
         },
-        Ok(Err(error)) => ExecuteResponse {
-            id: request.id,
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            error: Some(error.to_string()),
-            timed_out: false,
-        },
-        Err(_) => ExecuteResponse {
+        Ok(None) => ExecuteResponse {
             id: request.id,
             exit_code: None,
             stdout: None,
@@ -698,7 +698,66 @@ async fn execute_guest_command(request: ExecuteRequest) -> ExecuteResponse {
             error: None,
             timed_out: true,
         },
+        Err(error) => ExecuteResponse {
+            id: request.id,
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            error: Some(error.to_string()),
+            timed_out: false,
+        },
     }
+}
+
+async fn execute_command_to_output(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    let mut child = command.spawn()?;
+    let process_group = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .map(Pid::from_raw);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("guest command stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("guest command stderr was not piped"))?;
+    let stdout = tokio::spawn(read_to_end(stdout));
+    let stderr = tokio::spawn(read_to_end(stderr));
+
+    let status = if let Ok(status) = tokio::time::timeout(timeout, child.wait()).await {
+        status?
+    } else {
+        if let Some(process_group) = process_group {
+            match killpg(process_group, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(std::io::Error::other(error)),
+            }
+        } else {
+            child.start_kill()?;
+        }
+        child.wait().await?;
+        stdout.await.map_err(std::io::Error::other)??;
+        stderr.await.map_err(std::io::Error::other)??;
+        return Ok(None);
+    };
+    let stdout = stdout.await.map_err(std::io::Error::other)??;
+    let stderr = stderr.await.map_err(std::io::Error::other)??;
+    Ok(Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+async fn read_to_end(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output).await?;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -864,5 +923,31 @@ mod tracing_tests {
                 .await
                 .unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod guest_command_tests {
+    use std::time::{Duration, Instant};
+
+    use super::execute_guest_command;
+    use crate::protocol::ExecuteRequest;
+
+    #[tokio::test]
+    async fn timeout_kills_descendants_holding_output_pipes() {
+        let started_at = Instant::now();
+        let response = execute_guest_command(ExecuteRequest {
+            id: 1,
+            program: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "sleep 30 & wait".to_owned()],
+            current_directory: "/".to_owned(),
+            environment: Vec::new(),
+            timeout_millis: 25,
+        })
+        .await;
+
+        assert!(response.timed_out);
+        assert!(response.error.is_none());
+        assert!(started_at.elapsed() < Duration::from_secs(1));
     }
 }

@@ -1,4 +1,12 @@
 mod checksum;
+mod published;
+
+pub use published::{
+    PublishedAgent, PublishedAgentDetails, PublishedAgentInfo, PublishedError,
+    PublishedObservation, PublishedObservationResult, PublishedQuery, PublishedResults,
+    PublishedResultsBuilder, PublishedStep, PublishedStepId, PublishedTask, PublishedToolCall,
+    PublishedTrajectory, PublishedTrial,
+};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

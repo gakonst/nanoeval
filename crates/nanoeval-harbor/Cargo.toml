@@ -15,8 +15,10 @@ description = "Streaming Harbor and ATIF output for Nanoeval"
 
 [dependencies]
 chrono.workspace = true
+futures-util.workspace = true
 ignore.workspace = true
 nanoeval.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

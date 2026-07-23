@@ -16,6 +16,7 @@ description = "VM-owned standard workspace tools for Nanocodex"
 [dependencies]
 async-trait = "0.1.89"
 nanocodex-tools.workspace = true
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -30,6 +30,7 @@ use nanoeval_harbor::{Harbor, HarborJob, HarborRecorder};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::process::Command;
 use tracing::{info, info_span, warn};
 use yansi::Painted;
@@ -43,6 +44,8 @@ const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
 const INVOCATION_VERSION: u32 = 1;
+const DEFAULT_HOST_UTILIZATION_PERCENT: u8 = 80;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 #[derive(Args)]
 #[group(id = "task_input", required = true, multiple = true)]
@@ -76,6 +79,15 @@ pub(crate) struct Eval {
     /// Maximum sum of task-declared memory across concurrent attempts.
     #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
     max_memory_mb: Option<u64>,
+
+    /// Percentage of detected host CPU and memory used for omitted scheduler limits.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_HOST_UTILIZATION_PERCENT,
+        value_name = "PERCENT",
+        value_parser = clap::value_parser!(u8).range(1..=100)
+    )]
+    host_utilization: u8,
 
     #[command(flatten)]
     lifecycle: RunLifecycleArgs,
@@ -160,6 +172,34 @@ struct ResolvedRun {
     vm_retention: VmRetention,
     thinking: Thinking,
     rerun_from: Option<PathBuf>,
+    automatic_scheduling: Option<AutomaticScheduling>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostResources {
+    logical_cpus: usize,
+    physical_memory_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SchedulingDefaults {
+    concurrency: u16,
+    max_memory_mb: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedScheduling {
+    concurrency: u16,
+    max_memory_mb: Option<u64>,
+    automatic: Option<AutomaticScheduling>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutomaticScheduling {
+    utilization_percent: u8,
+    host: HostResources,
+    concurrency: bool,
+    memory: bool,
 }
 
 struct RerunSelection {
@@ -241,6 +281,40 @@ struct LegacyAgentKwargs {
     effort: String,
 }
 
+impl HostResources {
+    fn detect() -> Self {
+        let logical_cpus = std::thread::available_parallelism().map_or(1, usize::from);
+        let system = System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+        );
+        let physical_memory_bytes = match system.total_memory() {
+            0 => None,
+            bytes => Some(bytes),
+        };
+        Self {
+            logical_cpus,
+            physical_memory_bytes,
+        }
+    }
+
+    fn scheduling_defaults(self, utilization_percent: u8) -> SchedulingDefaults {
+        let logical_cpus = u64::try_from(self.logical_cpus).unwrap_or(u64::MAX);
+        let concurrency = percentage(logical_cpus, utilization_percent).max(1);
+        let concurrency = u16::try_from(concurrency).unwrap_or(u16::MAX);
+        let max_memory_mb = self
+            .physical_memory_bytes
+            .map(|bytes| (percentage(bytes, utilization_percent) / BYTES_PER_MIB).max(1));
+        SchedulingDefaults {
+            concurrency,
+            max_memory_mb,
+        }
+    }
+}
+
+const fn percentage(value: u64, percent: u8) -> u64 {
+    value.saturating_mul(percent as u64) / 100
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetainedTrialStatus {
     Passed,
@@ -250,6 +324,46 @@ enum RetainedTrialStatus {
 }
 
 impl Eval {
+    fn resolve_scheduling(
+        &self,
+        retained: Option<&RunInvocation>,
+        legacy: Option<&LegacyJobConfig>,
+    ) -> ResolvedScheduling {
+        let host = HostResources::detect();
+        let defaults = host.scheduling_defaults(self.host_utilization);
+        let retained_concurrency = retained.map(|invocation| invocation.concurrency);
+        let legacy_concurrency = legacy.and_then(|job| u16::try_from(job.n_concurrent_trials).ok());
+        let automatic_concurrency = self.concurrency.is_none()
+            && retained_concurrency.is_none()
+            && legacy_concurrency.is_none();
+        let concurrency = self
+            .concurrency
+            .or(retained_concurrency)
+            .or(legacy_concurrency)
+            .unwrap_or(defaults.concurrency);
+        let (max_memory_mb, automatic_memory) = if let Some(memory) = self.max_memory_mb {
+            (Some(memory), false)
+        } else if let Some(invocation) = retained {
+            (invocation.max_memory_mb, false)
+        } else if legacy.is_some() {
+            (None, false)
+        } else {
+            (defaults.max_memory_mb, defaults.max_memory_mb.is_some())
+        };
+        let automatic =
+            (automatic_concurrency || automatic_memory).then_some(AutomaticScheduling {
+                utilization_percent: self.host_utilization,
+                host,
+                concurrency: automatic_concurrency,
+                memory: automatic_memory,
+            });
+        ResolvedScheduling {
+            concurrency,
+            max_memory_mb,
+            automatic,
+        }
+    }
+
     fn resolve_run(&self) -> Result<ResolvedRun> {
         let rerun = self
             .retry
@@ -307,28 +421,13 @@ impl Eval {
             || rerun
                 .as_ref()
                 .is_some_and(|rerun| retained_job_used_vm(&rerun.job));
+        let scheduling = self.resolve_scheduling(retained_invocation.as_ref(), legacy.as_ref());
         Ok(ResolvedRun {
             task_paths,
             output,
             trials: self.trials.unwrap_or(1),
-            concurrency: self
-                .concurrency
-                .or_else(|| {
-                    retained_invocation
-                        .as_ref()
-                        .map(|invocation| invocation.concurrency)
-                })
-                .or_else(|| {
-                    legacy
-                        .as_ref()
-                        .and_then(|legacy| u16::try_from(legacy.n_concurrent_trials).ok())
-                })
-                .unwrap_or(1),
-            max_memory_mb: self.max_memory_mb.or_else(|| {
-                retained_invocation
-                    .as_ref()
-                    .and_then(|invocation| invocation.max_memory_mb)
-            }),
+            concurrency: scheduling.concurrency,
+            max_memory_mb: scheduling.max_memory_mb,
             vm,
             vm_rootfs,
             vm_retention: self
@@ -341,15 +440,25 @@ impl Eval {
                 .unwrap_or_default(),
             thinking,
             rerun_from: rerun.map(|rerun| rerun.job),
+            automatic_scheduling: scheduling.automatic,
         })
+    }
+
+    fn resolve_executable_run(&self) -> Result<Option<ResolvedRun>> {
+        let resolved = self.resolve_run()?;
+        if self.retry.list {
+            write_task_names(&resolved.task_paths, self.json)?;
+            return Ok(None);
+        }
+        resolved.report_automatic_scheduling();
+        Ok(Some(resolved))
     }
 
     pub(crate) async fn run(self) -> Result<()> {
         let total_started = Instant::now();
-        let resolved = self.resolve_run()?;
-        if self.retry.list {
-            return write_task_names(&resolved.task_paths, self.json);
-        }
+        let Some(resolved) = self.resolve_executable_run()? else {
+            return Ok(());
+        };
         let observability_started = Instant::now();
         let _observability = self.observability.install()?;
         let observability = observability_started.elapsed();
@@ -488,6 +597,34 @@ impl Eval {
 }
 
 impl ResolvedRun {
+    fn report_automatic_scheduling(&self) {
+        let Some(automatic) = self.automatic_scheduling else {
+            return;
+        };
+        let memory = automatic.host.physical_memory_bytes.map_or_else(
+            || "unknown RAM".to_owned(),
+            |bytes| format!("{} MiB RAM", bytes / BYTES_PER_MIB),
+        );
+        let concurrency_source = if automatic.concurrency {
+            "automatic"
+        } else {
+            "configured"
+        };
+        let memory_source = if automatic.memory {
+            "automatic"
+        } else {
+            "configured"
+        };
+        let max_memory = self
+            .max_memory_mb
+            .map_or_else(|| "unbounded".to_owned(), |memory| format!("{memory} MiB"));
+        eprintln!(
+            "Host scheduling: target={}%, detected={} logical CPUs/{memory}, \
+             concurrency={} ({concurrency_source}), memory={max_memory} ({memory_source})",
+            automatic.utilization_percent, automatic.host.logical_cpus, self.concurrency,
+        );
+    }
+
     fn invocation(&self) -> RunInvocation {
         RunInvocation {
             version: INVOCATION_VERSION,
@@ -2590,9 +2727,10 @@ mod tests {
     use nanoeval::Task;
 
     use super::{
-        CACHED_VERIFIER_SCRIPT, Eval, cached_verifier_script, load_tasks,
-        load_vm_guest_runtime_record, recognized_verifier_setup, remove_passed_rootfs,
-        retained_retry_task_names, retained_task_durations, stage_vm_guest_runtime, verifier_shell,
+        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, Eval, HostResources,
+        cached_verifier_script, load_tasks, load_vm_guest_runtime_record,
+        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
+        retained_task_durations, stage_vm_guest_runtime, verifier_shell,
     };
 
     #[derive(Parser)]
@@ -2626,9 +2764,56 @@ mod tests {
         assert_eq!(cli.eval.trials, Some(5));
         assert_eq!(cli.eval.concurrency, Some(10));
         assert_eq!(cli.eval.max_memory_mb, Some(24_576));
+        assert_eq!(cli.eval.host_utilization, DEFAULT_HOST_UTILIZATION_PERCENT);
         assert!(cli.eval.vm);
         assert!(!cli.eval.vm_retention.unwrap_or_default().retains_passes());
         assert!(cli.eval.suites.is_empty());
+    }
+
+    #[test]
+    fn host_defaults_use_the_configured_share_of_cpu_and_memory() {
+        let host = HostResources {
+            logical_cpus: 10,
+            physical_memory_bytes: Some(32 * 1024 * 1024 * 1024),
+        };
+
+        let defaults = host.scheduling_defaults(80);
+
+        assert_eq!(defaults.concurrency, 8);
+        assert_eq!(defaults.max_memory_mb, Some(26_214));
+    }
+
+    #[test]
+    fn host_defaults_keep_at_least_one_execution_slot() {
+        let host = HostResources {
+            logical_cpus: 1,
+            physical_memory_bytes: None,
+        };
+
+        let defaults = host.scheduling_defaults(1);
+
+        assert_eq!(defaults.concurrency, 1);
+        assert_eq!(defaults.max_memory_mb, None);
+    }
+
+    #[test]
+    fn explicit_scheduler_limits_disable_automatic_resolution() {
+        let cli = TestCli::try_parse_from([
+            "nanoeval",
+            "--task",
+            "tasks/first",
+            "--concurrency",
+            "3",
+            "--max-memory-mb",
+            "4096",
+        ])
+        .unwrap();
+
+        let resolved = cli.eval.resolve_run().unwrap();
+
+        assert_eq!(resolved.concurrency, 3);
+        assert_eq!(resolved.max_memory_mb, Some(4_096));
+        assert_eq!(resolved.automatic_scheduling, None);
     }
 
     #[test]

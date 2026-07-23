@@ -1,3 +1,4 @@
+mod compare;
 mod config;
 mod eval;
 mod inspect;
@@ -51,6 +52,9 @@ enum Command {
 
     /// Explain a retained Harbor job or trial and surface exact failure evidence.
     Inspect(inspect::Inspect),
+
+    /// Compare a task with successful attempts from Harbor's public archive.
+    Compare(compare::Compare),
 
     /// Run one command in a libkrun microVM.
     Vm {
@@ -432,6 +436,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Inspect(command) => command.run()?,
+        Command::Compare(command) => command.run().await?,
         Command::Vm {
             command:
                 VmCommand::Prepare {
