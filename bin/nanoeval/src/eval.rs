@@ -44,6 +44,7 @@ const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
 const INVOCATION_VERSION: u32 = 1;
+const DEFAULT_TRIALS: u16 = 5;
 const DEFAULT_HOST_UTILIZATION_PERCENT: u8 = 80;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
@@ -68,9 +69,13 @@ pub(crate) struct Eval {
     #[arg(long)]
     output: Option<PathBuf>,
 
-    /// Number of fresh, independent attempts per task.
-    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
-    trials: Option<u16>,
+    /// Number of fresh, independent attempts per task. Defaults to k=5.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TRIALS,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    trials: u16,
 
     /// Maximum number of attempts executing at once.
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
@@ -425,7 +430,7 @@ impl Eval {
         Ok(ResolvedRun {
             task_paths,
             output,
-            trials: self.trials.unwrap_or(1),
+            trials: self.trials,
             concurrency: scheduling.concurrency,
             max_memory_mb: scheduling.max_memory_mb,
             vm,
@@ -2727,8 +2732,8 @@ mod tests {
     use nanoeval::Task;
 
     use super::{
-        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, Eval, HostResources,
-        cached_verifier_script, load_tasks, load_vm_guest_runtime_record,
+        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, Eval,
+        HostResources, cached_verifier_script, load_tasks, load_vm_guest_runtime_record,
         recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
         retained_task_durations, stage_vm_guest_runtime, verifier_shell,
     };
@@ -2761,13 +2766,23 @@ mod tests {
             cli.eval.tasks,
             [PathBuf::from("tasks/first"), PathBuf::from("tasks/second")]
         );
-        assert_eq!(cli.eval.trials, Some(5));
+        assert_eq!(cli.eval.trials, 5);
         assert_eq!(cli.eval.concurrency, Some(10));
         assert_eq!(cli.eval.max_memory_mb, Some(24_576));
         assert_eq!(cli.eval.host_utilization, DEFAULT_HOST_UTILIZATION_PERCENT);
         assert!(cli.eval.vm);
         assert!(!cli.eval.vm_retention.unwrap_or_default().retains_passes());
         assert!(cli.eval.suites.is_empty());
+    }
+
+    #[test]
+    fn defaults_to_five_independent_trials_per_task() {
+        let cli = TestCli::try_parse_from(["nanoeval", "--task", "tasks/first"]).unwrap();
+
+        let resolved = cli.eval.resolve_run().unwrap();
+
+        assert_eq!(cli.eval.trials, DEFAULT_TRIALS);
+        assert_eq!(resolved.trials, DEFAULT_TRIALS);
     }
 
     #[test]

@@ -265,9 +265,9 @@ over the full canonical name. By default, rerun selects only scored failures;
 `--include-refused` adds typed safety refusals and `--include-errored` adds
 harness errors. `--list` prints short readable task names and exits before
 loading credentials or preparing a VM; add `--json` for canonical names as a
-typed JSON array. A retry prints the selected names before starting one fresh
-trial per task in a new Harbor job. Pass `--trials 5` to retry each selected
-task five times.
+typed JSON array. A retry starts the default five fresh independent trials per
+selected task in a new Harbor job. Pass `--trials 1` only when a single cheap
+smoke attempt is intentional.
 
 Nanoeval retains the source job's non-secret execution policy—thinking level,
 concurrency, memory ceiling, VM mode/rootfs, and VM retention—while explicit CLI
@@ -307,18 +307,21 @@ reasoning and observations. `--json` returns the same typed library result
 without the human projection, and `--refresh` checks for a newer archive
 revision.
 
-Every `--task` is one eval and `--trials` applies to each one. Run the complete
-three-eval, `k=5` suite with:
+Every `--task` is one eval and the CLI defaults to `k=5`: five fresh independent
+attempts per task. Run the complete three-eval suite with:
 
 ```sh
 cargo run -- run \
   --task tasks/write-greeting \
   --task tasks/uppercase-message \
   --task tasks/extract-todos \
-  --trials 5 \
   --concurrency 15 \
   --thinking low
 ```
+
+Nanoeval retains every trial separately. Its task-level pass@5 is whether at
+least one of the five trials passes; per-trial rewards remain available for
+mean-success and variance reporting.
 
 Nanoeval also reuses the ChatGPT authorization file managed by Codex and
 Nanocodex. Without `OPENAI_API_KEY`, it loads `${CODEX_HOME}/auth.json` or
