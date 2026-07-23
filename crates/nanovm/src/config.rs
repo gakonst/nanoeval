@@ -10,13 +10,31 @@ pub enum RootFilesystem {
 }
 
 /// Network access supplied to the guest by libkrun.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Network {
     /// Do not attach a virtio-vsock device or proxy guest internet sockets.
     Disabled,
     /// Proxy guest internet sockets through libkrun TSI.
     #[default]
     Internet,
+    /// A private virtio-net interface connected to a gvproxy unixgram socket.
+    ///
+    /// Unlike TSI, this gives the guest its own loopback and port namespace.
+    Gvproxy {
+        socket: PathBuf,
+        mac_address: [u8; 6],
+    },
+}
+
+impl Network {
+    /// Creates a private virtio-net interface backed by gvproxy.
+    #[must_use]
+    pub fn gvproxy(socket: impl Into<PathBuf>) -> Self {
+        Self::Gvproxy {
+            socket: socket.into(),
+            mac_address: [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee],
+        }
+    }
 }
 
 /// One additional block device attached after the root disk.
@@ -195,8 +213,8 @@ impl VmConfig {
     }
 
     #[must_use]
-    pub const fn network_value(&self) -> Network {
-        self.network
+    pub const fn network_value(&self) -> &Network {
+        &self.network
     }
 
     #[must_use]
@@ -225,7 +243,7 @@ mod tests {
         );
         assert_eq!(config.cpus_value(), 2);
         assert_eq!(config.memory_mib_value(), 1_024);
-        assert_eq!(config.network_value(), Network::Internet);
+        assert_eq!(config.network_value(), &Network::Internet);
     }
 
     #[test]
@@ -237,7 +255,20 @@ mod tests {
 
         assert_eq!(config.cpus_value(), 8);
         assert_eq!(config.memory_mib_value(), 4_096);
-        assert_eq!(config.network_value(), Network::Disabled);
+        assert_eq!(config.network_value(), &Network::Disabled);
+    }
+
+    #[test]
+    fn gvproxy_network_has_an_isolated_default_identity() {
+        let network = Network::gvproxy("/tmp/network.sock");
+
+        assert_eq!(
+            network,
+            Network::Gvproxy {
+                socket: PathBuf::from("/tmp/network.sock"),
+                mac_address: [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee],
+            }
+        );
     }
 
     #[test]

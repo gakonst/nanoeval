@@ -25,7 +25,7 @@ eyre = "0.6"
 futures-util = "0.3.31"
 flate2 = "1.1"
 ignore = "0.4.31"
-krun = { package = "libkrun", git = "https://github.com/containers/libkrun", branch = "main", features = ["blk"] }
+krun = { package = "libkrun", git = "https://github.com/containers/libkrun", branch = "main", features = ["blk", "net"] }
 nanocodex = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "508c025469006c90bc984b66e8b5c56762cc9da7" }
 nanocodex-observability = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "508c025469006c90bc984b66e8b5c56762cc9da7" }
 nanocodex-tools = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "508c025469006c90bc984b66e8b5c56762cc9da7", default-features = false }
@@ -47,6 +47,7 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+yansi = { version = "1.0", features = ["detect-tty", "detect-env"] }
 zstd = "0.13"
 
 [workspace.lints.rust]

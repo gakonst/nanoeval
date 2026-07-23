@@ -35,6 +35,7 @@ const BUILD_CONTEXT_DEVICE: &str = "/dev/vdc";
 const BUILD_RUNTIME_MOUNT: &str = "/run/nanoeval";
 const BUILD_CONTEXT_MOUNT: &str = "/mnt/nanoeval-context";
 const DEFAULT_GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const BUILD_VM_MEMORY_MIB: u64 = 4_096;
 const COPY_SCRIPT: &str = r#"set -eu
 dest=$1
 shift
@@ -161,11 +162,14 @@ pub(crate) enum ImageError {
     #[error("VM image build failed: {0}")]
     Vm(#[from] VmToolSessionError),
 
-    #[error("Dockerfile stage {stage} instruction {instruction} exited with {exit_code}: {stderr}")]
+    #[error(
+        "Dockerfile stage {stage} instruction {instruction} exited with {exit_code}\nstdout (tail):\n{stdout}\nstderr (tail):\n{stderr}"
+    )]
     BuildStep {
         stage: usize,
         instruction: usize,
         exit_code: i32,
+        stdout: String,
         stderr: String,
     },
 
@@ -848,7 +852,7 @@ fn build_vmm_command(
         .arg("--cpus")
         .arg("2")
         .arg("--memory-mib")
-        .arg("2048")
+        .arg(BUILD_VM_MEMORY_MIB.to_string())
         .arg("/bin/sh")
         .arg("-c")
         .arg(format!(
@@ -1048,14 +1052,23 @@ async fn run_build_command(
     if output.exit_code == 0 {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.chars().take(8_192).collect();
+    let stdout = output_tail(&output.stdout);
+    let stderr = output_tail(&output.stderr);
     Err(ImageError::BuildStep {
         stage,
         instruction,
         exit_code: output.exit_code,
+        stdout,
         stderr,
     })
+}
+
+fn output_tail(output: &[u8]) -> String {
+    const MAXIMUM_CHARS: usize = 8_192;
+
+    let output = String::from_utf8_lossy(output);
+    let skip = output.chars().count().saturating_sub(MAXIMUM_CHARS);
+    output.chars().skip(skip).collect()
 }
 
 fn build_environment(
@@ -1522,7 +1535,7 @@ mod tests {
     use std::{collections::BTreeMap, fs, process::Command};
 
     use super::{
-        COPY_SCRIPT, DockerfileRecipe, disk_cache_key, docker_process_environment,
+        COPY_SCRIPT, DockerfileRecipe, disk_cache_key, docker_process_environment, output_tail,
         reference_cache_key,
     };
 
@@ -1637,5 +1650,16 @@ CMD ["/bin/sh"]
             reference_cache_key("python:3.13-slim-bookworm"),
             reference_cache_key("python:3.12-slim-bookworm")
         );
+    }
+
+    #[test]
+    fn build_failure_diagnostics_keep_the_output_tail() {
+        let mut output = vec![b'a'; 8_192];
+        output.extend_from_slice(b"final compiler error");
+
+        let retained = output_tail(&output);
+
+        assert_eq!(retained.chars().count(), 8_192);
+        assert!(retained.ends_with("final compiler error"));
     }
 }
