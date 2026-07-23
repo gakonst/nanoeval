@@ -186,13 +186,98 @@ Run a complete suite without expanding 89 `--task` flags:
 cargo run -- run \
   --suite /path/to/terminal-bench-2-1 \
   --trials 1 \
-  --concurrency 16 \
+  --concurrency 8 \
+  --max-memory-mb 24576 \
   --thinking low \
   --vm
 ```
 
 `--suite` selects immediate child directories containing `task.toml` in stable
 name order. It may be combined with explicit, repeated `--task` inputs.
+Execution is prioritized by the median duration of matching retained trials,
+falling back to declared task timeouts when no trustworthy history exists.
+Results and trial numbers remain deterministic; only dispatch order changes.
+`--max-memory-mb` is an optional job-wide admission ceiling over each task's
+declared guest memory. Slot and memory permits are acquired atomically; a
+smaller task may proceed when an earlier large task does not fit, and a task
+larger than the ceiling runs alone rather than deadlocking. Omitting the option
+retains the simple concurrency-only policy.
+
+The default CLI lifecycle is interruption-safe. Before starting a new job,
+Nanoeval reopens the newest incomplete job whose typed `run.json` exactly
+matches the requested task roots, agent ID, and trial count. Every trial with a
+durable `result.json` is skipped, while an attempt that was active during
+Ctrl+C is restarted with a fresh Nanocodex session and CoW disk:
+
+```sh
+# The first invocation may be interrupted.
+cargo run -- run \
+  --suite /path/to/terminal-bench-2-1 \
+  --trials 1 \
+  --concurrency 6 \
+  --thinking low \
+  --vm
+
+# The identical command resumes only missing trials in the same Harbor job.
+cargo run -- run \
+  --suite /path/to/terminal-bench-2-1 \
+  --trials 1 \
+  --concurrency 6 \
+  --thinking low \
+  --vm
+```
+
+An OS advisory lock prevents two processes from mutating the same job.
+`--new` deliberately starts a separate job even when a matching incomplete
+one exists. Resume is attempt-level, not conversation-level: Nanoeval never
+reuses partial model history, a half-mutated guest, or an event sequence after
+interruption.
+
+Completed failures have a separate Foundry-style retry loop:
+
+```sh
+# Retry every reward-zero task from the last completed job.
+cargo run -- run --rerun
+
+# Inspect the retry queue without running agents.
+cargo run -- run --rerun --list
+
+# Literal positional substrings are the short, Foundry-style path.
+cargo run -- run --rerun webserver
+cargo run -- run --rerun torch dna
+
+# Use the explicit flag only for regular expressions.
+cargo run -- run --rerun \
+  --match-task 'nginx|git' \
+  --match-task '^terminal-bench/torch-'
+
+# Select a specific retained job instead of the last one.
+cargo run -- run --rerun \
+  --rerun-from nanoeval-runs/<job-id> \
+  configure-git-webserver
+```
+
+Positional names are escaped literal substrings and repeated values are ORed;
+`webserver` therefore selects `terminal-bench/configure-git-webserver` without
+requiring regex syntax. `--match-task` is the advanced regular-expression form
+over the full canonical name. By default, rerun selects only scored failures;
+`--include-refused` adds typed safety refusals and `--include-errored` adds
+harness errors. `--list` prints short readable task names and exits before
+loading credentials or preparing a VM; add `--json` for canonical names as a
+typed JSON array. A retry prints the selected names before starting one fresh
+trial per task in a new Harbor job. Pass `--trials 5` to retry each selected
+task five times.
+
+Nanoeval retains the source job's non-secret execution policy—thinking level,
+concurrency, memory ceiling, VM mode/rootfs, and VM retention—while explicit CLI
+flags override it. Credentials are never copied into retained state. Each job's
+typed `invocation.json` makes this inheritance deterministic, and
+`.nanoeval/last-run.json` points to the latest completed local job. An
+interrupted retry uses the ordinary durable-resume path when the same command is
+repeated; the completed source job is never mutated. Filtered retries form a
+typed lineage: each child result replaces that task's prior status, while
+unselected failures remain in the effective queue. A passing retry therefore
+removes one task without hiding its unresolved siblings.
 
 Every `--task` is one eval and `--trials` applies to each one. Run the complete
 three-eval, `k=5` suite with:
@@ -291,6 +376,7 @@ let task = Task::load("tasks/write-greeting")?;
 let (eval, events) = Nanoeval::builder(Nanocodex::builder("api-key"))
     .output_directory("nanoeval-native-runs")
     .max_concurrency(5)
+    .max_memory_mb(24_576)
     .build()?;
 
 let mut observer = events.subscribe();
@@ -347,11 +433,17 @@ let sweep = Sweep::builder()
 
 assert_eq!(sweep.attempt_count(), 10);
 let (eval, events) = Nanoeval::builder(nanocodex)
+    .output_directory("nanoeval-runs")
+    .resume_incomplete(&sweep)
     .max_concurrency(10)
     .build()?;
+let remaining = eval.remaining_attempts(&sweep)?;
 let results = eval.sweep(sweep).await?;
-assert_eq!(results.attempts().len(), 10);
-assert_eq!(results.attempts()[0].agent().as_str(), "thinking-low");
+assert_eq!(results.attempts().len(), remaining);
+assert_eq!(results.attempts().len() + results.skipped(), 10);
+if let Some(first) = results.attempts().first() {
+    assert_eq!(first.agent().as_str(), "thinking-low");
+}
 # drop(events);
 # Ok(())
 # }
@@ -607,7 +699,8 @@ virtiofs. `count-dataset-tokens` was rebuilt from the Linux/ARM64
 unmodified verifier passed with
 answer `79586` and reward `1`; the retained output includes the mutated ext4
 disk, `answer.txt`, `ctrf.json`, ATIF-v1.7 trajectory, and Harbor-shaped result.
-This is intentionally still a one-task/one-trial gate.
+This was the initial one-task/one-trial gate; the same path now executes the
+complete 89-task suite.
 
 On the July 22, 2026 Apple Silicon development host, a clean cache took 8.13
 seconds to resolve, download, flatten, and create the 10 GiB sparse ext4 image;
@@ -647,9 +740,13 @@ script, disk geometry, and cache builder version. A private CoW clone is
 attached at initial boot but mounted only after the agent phase. Unknown
 verifier shapes execute cold. A miss runs the byte-for-byte canonical script
 and atomically publishes the cache only after the pinned uv installation
-exists; a hit starts the same script at its recognized post-bootstrap byte
-boundary. The task-owned test and reward logic is unchanged, and concurrent
-trials never share writable package state.
+exists. For the exact pinned Terminal-Bench `apt curl -> uv installer -> uv
+activation` bootstrap, a hit omits the whole recognized bootstrap and activates
+the cached installation directly; this avoids rerunning a network-bound
+`apt-get update` whose only purpose was installing the already-unneeded curl.
+The matcher rejects any additional setup command rather than silently omitting
+task state. The task-owned `uvx`, test, and reward logic remain unchanged.
+Concurrent trials never share writable package or rootfs state.
 
 `regex-log` supplied the second canonical task proof and a different base image,
 `ubuntu:24.04`. Direct OCI images leave `/etc/resolv.conf` for the container
@@ -692,6 +789,67 @@ guest tool work was 9.69 ms and fresh-guest verification 285.86 ms. The retained
 Harbor job passed with reward `1`, 4 ATIF-v1.7 steps, and 23,808 of 25,714 agent
 input tokens served from cache.
 
+The complete warm milestone ran all 89 Terminal-Bench 2.1 tasks in one durable
+VM-backed job at concurrency six on the same Apple Silicon host. It completed
+in **3,523.21 seconds (58m43s)**, compared with 3,988 seconds (66m28s) for the
+earlier alphabetical Nanoeval run. Duration-aware ordering therefore removed
+about 7m45s, or 11.7%, without changing task inputs or concurrency. The result
+contained 62 passes, 22 normal verifier-scored failures, four typed API safety
+refusals, and one agent timeout. There were no environment, verifier,
+VM-session, or Nanoeval errors.
+
+The run reused 29,675,008 of 32,741,686 input tokens (90.63%). Aggregate work
+was 11,409 agent-model seconds, 6,294 guest-tool seconds, and 2,086 canonical
+verifier seconds; those overlap across six attempts. Task loading, cached guest
+runtime preparation, cached environment preparation, evaluator setup, Harbor
+finalization, and output together took about 2.2 seconds outside the attempt
+wall. This is the important developer-loop result: changing the Rust harness
+does not rebuild task images, and Docker is absent from the warm critical path.
+
+The service regressions all pass in the full concurrent run:
+`pypi-server`, `git-multibranch`, `install-windows-3.11`, and
+`nginx-request-logging`. Each agent and verifier shared one live guest, while
+each attempt had private loopback, processes, and CoW disks. Harbor 0.20.0's own
+models accepted the job plus all 89 trial configs, results, and ATIF-v1.7
+trajectories. `harbor view` served the aggregate, a passing service trial, and
+its trajectory through the normal viewer APIs.
+
+The 89-task measurement used Nanocodex `508c0254`. After advancing Nanoeval's
+workspace pin to current master `f1b4f8bc`, a real `regex-log` VM smoke passed
+in 42.61 seconds with reward `1`, five Harbor-valid ATIF steps, a cached task
+image, and a verifier dependency-cache hit. The revision change produced one
+new content-addressed guest runtime. The immediate repeat resolved that runtime
+in 0.87 ms and the task environment in 0.95 ms, hit the same verifier cache,
+and passed again without rebuilding an image.
+
+The definitive current-master run used concurrency eight plus a 24 GiB
+task-declared memory ceiling. All 89 attempts reached trustworthy terminal
+artifacts in **3,310.32 seconds (55m10s)**, 6.04% faster than the prior
+concurrency-six milestone: 68 passed, 17 were ordinary verifier-scored
+failures, four were typed safety refusals, and zero errored. The other 88
+attempts completed in exactly 2,520 seconds (42m00s); the final generated
+tensor-parallel candidate then reached the benchmark's canonical 900-second
+verifier deadline. Nanoeval retained that deadline as exit-124 evidence,
+reward `0.0`, and no exception instead of misclassifying it as a harness error.
+The run reused 29,143,296 of 32,101,467 input tokens (90.78%) and had no
+environment, VM-session, verifier-infrastructure, or Nanoeval failure.
+
+Harbor 0.20 accepted the final job plus every one of its 89 configs, results,
+and ATIF trajectories. `harbor view` served the 89-trial aggregate, the
+deadline-scored tensor trial, and its eight-step trajectory directly. The four
+service regressions—`pypi-server`, `git-multibranch`,
+`install-windows-3.11`, and `nginx-request-logging`—all passed with their
+agent-started processes and private loopback retained in the same guest through
+verification.
+
+The memory-aware scheduler kept the declared live set at or below 24 GiB,
+including three concurrent 8 GiB attempts, and a separate three-task VM proof
+with a 256 MiB ceiling showed strictly non-overlapping attempts. A deterministic
+library test also proves work-conserving admission: a fitting small task may use
+an available slot while a larger waiter is memory-blocked. Nanoeval does not
+yet claim a speed ratio against Harbor because an exact same-revision Harbor
+baseline has not been run.
+
 ## Tasks
 
 `Task::load` reads a typed Terminal-Bench 2.1 task directory:
@@ -727,6 +885,9 @@ nanoeval-runs/
     ├── lock.json
     ├── result.json
     ├── job.log
+    ├── job.json
+    ├── run.json
+    ├── .nanoeval.lock
     └── <trial-name>/
         ├── config.json
         ├── lock.json
@@ -741,6 +902,11 @@ nanoeval-runs/
         ├── artifacts/
         └── workspace/
 ```
+
+`job.json`, `run.json`, `invocation.json`, and the advisory lock are Nanoeval's
+typed durable lifecycle state; Harbor ignores those extra files. Trial and job
+`result.json` files remain the terminal commit points used by resume, rerun
+selection, and Harbor tooling.
 
 Open it directly with Harbor:
 
@@ -894,11 +1060,15 @@ output needed to inspect and compare runs with Harbor tooling.
 
 ## Current tradeoffs
 
-Nanoeval currently supports one agent SDK, one native verifier shape, and a
-small subset of Terminal-Bench task environments. Native mode offers workspace
-disposability but no hostile-code containment. The libkrun worker, direct OCI
-materializer, resource enforcement, cancellation protocol, and full
-Terminal-Bench 2.1 gate remain under active development.
+Nanoeval intentionally supports one agent SDK and one Terminal-Bench verifier
+contract. Native mode offers workspace disposability but no hostile-code
+containment. The VM path directly materializes every environment recipe in the
+89-task Terminal-Bench 2.1 suite on Linux/ARM64, but currently boots one
+libkrun guest per attempt rather than pooling warm multi-attempt workers.
+Hardware CPU and memory boundaries come from the VM; job-level weighted memory
+admission uses task declarations, while weighted CPU admission, sealed VM
+snapshots, architectures other than the host, and task-specific outbound-network
+policy remain active work.
 
 That is substantially less infrastructure than a mature eval platform. It is
 also much less machinery between a task and an agent attempt.

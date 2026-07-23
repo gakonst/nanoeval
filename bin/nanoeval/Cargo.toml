@@ -26,6 +26,7 @@ nanoeval-harbor.workspace = true
 nanovm.workspace = true
 oci-client.workspace = true
 reflink-copy.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

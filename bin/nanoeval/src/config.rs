@@ -15,14 +15,18 @@ pub(crate) struct AgentArgs {
     auth_file: Option<PathBuf>,
 
     /// Reasoning effort used by every fresh task agent.
-    #[arg(long, env = "OPENAI_REASONING_EFFORT", default_value_t)]
-    thinking: Thinking,
+    #[arg(long, env = "OPENAI_REASONING_EFFORT")]
+    thinking: Option<Thinking>,
 }
 
 impl AgentArgs {
-    pub(crate) fn builder(self) -> Result<NanocodexBuilder> {
+    pub(crate) fn builder(self, thinking: Thinking) -> Result<NanocodexBuilder> {
         let auth = Self::select_auth(self.api_key, self.auth_file, Self::environment_api_key()?)?;
-        Ok(Nanocodex::builder(auth).thinking(self.thinking))
+        Ok(Nanocodex::builder(auth).thinking(thinking))
+    }
+
+    pub(crate) const fn thinking(&self) -> Option<Thinking> {
+        self.thinking
     }
 
     fn select_auth(

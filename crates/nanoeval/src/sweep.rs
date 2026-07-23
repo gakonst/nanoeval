@@ -183,6 +183,12 @@ impl Sweep {
     }
 }
 
+impl RunManifest {
+    pub(crate) fn attempt_count(&self) -> usize {
+        self.tasks.len() * self.agents.len() * usize::from(self.trials.get())
+    }
+}
+
 impl fmt::Debug for SweepAgent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -288,6 +294,16 @@ impl SweepAttempt<'_> {
 
     pub(crate) const fn trial(&self) -> u16 {
         self.trial
+    }
+
+    pub(crate) fn trial_prefix(&self) -> String {
+        let short_name = self
+            .task
+            .name()
+            .rsplit('/')
+            .next()
+            .unwrap_or_else(|| self.task.name());
+        format!("{short_name}__{}__{:03}", self.agent.id, self.trial)
     }
 }
 

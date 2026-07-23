@@ -1,12 +1,14 @@
 use std::{
-    collections::BTreeMap,
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs,
     future::Future,
-    io,
+    io::{self, Write},
     num::ParseFloatError,
     path::{Path, PathBuf},
     pin::Pin,
+    str::FromStr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,16 +16,18 @@ use arcbox_ext4::{
     Formatter, Reader,
     constants::{file_mode, make_mode},
 };
+use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use eyre::{Result, eyre};
-use nanocodex::{Tools, ToolsBuildError, UpdatePlanTool};
-use nanocodex_vm::{VmCommand, VmToolSession, VmToolSessionError, VmTools};
+use nanocodex::{Thinking, Tools, ToolsBuildError, UpdatePlanTool};
+use nanocodex_vm::{VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmTools};
 use nanoeval::{
     AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEventKind, EvalFailure,
-    EvalFailureKind, EvalResult, EvalStatus, Nanoeval, NanoevalEventStream, Sweep, Task,
-    VerifierResult,
+    EvalFailureKind, EvalResult, EvalStatus, Nanoeval, NanoevalBuilder, NanoevalEventStream, Sweep,
+    SweepResults, Task, VerifierResult,
 };
-use nanoeval_harbor::{Harbor, HarborJob};
+use nanoeval_harbor::{Harbor, HarborJob, HarborRecorder};
+use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -34,6 +38,11 @@ use crate::config::AgentArgs;
 use crate::observability::ObservabilityArgs;
 use crate::vm_image::{CachePolicy, PreparedRootDisk, VmImageBuilder};
 use crate::vm_network::{Gvproxy, GvproxyError, prepare_gvproxy};
+
+const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
+const INVOCATION_FILE: &str = "invocation.json";
+const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
+const INVOCATION_VERSION: u32 = 1;
 
 #[derive(Args)]
 #[group(id = "task_input", required = true, multiple = true)]
@@ -49,17 +58,27 @@ pub(crate) struct Eval {
     #[arg(long = "suite", value_name = "DIRECTORY", group = "task_input")]
     suites: Vec<PathBuf>,
 
+    #[command(flatten)]
+    retry: RetryArgs,
+
     /// Parent directory for the retained Harbor-compatible job.
-    #[arg(long, default_value = "nanoeval-runs")]
-    output: PathBuf,
+    #[arg(long)]
+    output: Option<PathBuf>,
 
     /// Number of fresh, independent attempts per task.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
-    trials: u16,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    trials: Option<u16>,
 
     /// Maximum number of attempts executing at once.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
-    concurrency: u16,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    concurrency: Option<u16>,
+
+    /// Maximum sum of task-declared memory across concurrent attempts.
+    #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+    max_memory_mb: Option<u64>,
+
+    #[command(flatten)]
+    lifecycle: RunLifecycleArgs,
 
     /// Print typed results as JSON instead of a human summary.
     #[arg(long)]
@@ -78,32 +97,272 @@ pub(crate) struct Eval {
     vm_refresh: bool,
 
     /// Writable VM root-disk retention policy.
-    #[arg(long, value_enum, default_value_t, requires = "vm")]
-    vm_retention: VmRetention,
+    #[arg(long, value_enum)]
+    vm_retention: Option<VmRetention>,
 
     #[command(flatten)]
     agent: AgentArgs,
 }
 
+#[derive(Args)]
+struct RetryArgs {
+    /// Rerun unresolved tasks from the latest completed Nanoeval job.
+    #[arg(long, group = "task_input", conflicts_with_all = ["tasks", "suites"])]
+    rerun: bool,
+
+    /// Literal task-name substring to rerun. Repeat positional values for OR matching.
+    #[arg(value_name = "NAME", requires = "rerun")]
+    names: Vec<String>,
+
+    /// Resolve the retry queue from this job instead of the latest completed job.
+    #[arg(long, value_name = "JOB", requires = "rerun")]
+    rerun_from: Option<PathBuf>,
+
+    /// Advanced regular expression over full task names. Repeat for OR matching.
+    #[arg(long, value_name = "REGEX", requires = "rerun")]
+    match_task: Vec<String>,
+
+    /// Print the selected task names without starting a new evaluation job.
+    #[arg(long, requires = "rerun")]
+    list: bool,
+
+    #[command(flatten)]
+    statuses: RetryStatusArgs,
+}
+
+#[derive(Args)]
+struct RetryStatusArgs {
+    /// Include typed safety refusals in the rerun selection.
+    #[arg(long, requires = "rerun")]
+    include_refused: bool,
+
+    /// Include harness-errored tasks in the rerun selection.
+    #[arg(long, requires = "rerun")]
+    include_errored: bool,
+}
+
+#[derive(Args)]
+struct RunLifecycleArgs {
+    /// Start a new job even when a matching incomplete job can be resumed.
+    #[arg(long = "new")]
+    new_job: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedRun {
+    task_paths: Vec<PathBuf>,
+    output: PathBuf,
+    trials: u16,
+    concurrency: u16,
+    max_memory_mb: Option<u64>,
+    vm: bool,
+    vm_rootfs: Option<PathBuf>,
+    vm_retention: VmRetention,
+    thinking: Thinking,
+    rerun_from: Option<PathBuf>,
+}
+
+struct RerunSelection {
+    job: PathBuf,
+    tasks: Vec<PathBuf>,
+}
+
+struct RetainedRetryQueue {
+    task_names: BTreeSet<String>,
+    unresolved_tasks: usize,
+    lineage: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunInvocation {
+    version: u32,
+    trials: u16,
+    concurrency: u16,
+    max_memory_mb: Option<u64>,
+    vm: bool,
+    vm_rootfs: Option<PathBuf>,
+    vm_retention: VmRetention,
+    thinking: String,
+    rerun_from: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LastRun {
+    job: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetainedRun {
+    tasks: Vec<RetainedRunTask>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetainedRunTask {
+    root: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetainedJobIdentity {
+    started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetainedTrialResult {
+    task_name: String,
+    verifier_result: Option<RetainedVerifierResult>,
+    exception_info: Option<RetainedTrialException>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetainedVerifierResult {
+    rewards: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetainedTrialException {
+    exception_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyJobConfig {
+    n_concurrent_trials: usize,
+    agents: Vec<LegacyAgentConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyAgentConfig {
+    kwargs: LegacyAgentKwargs,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyAgentKwargs {
+    effort: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedTrialStatus {
+    Passed,
+    Failed,
+    Refused,
+    Errored,
+}
+
 impl Eval {
+    fn resolve_run(&self) -> Result<ResolvedRun> {
+        let rerun = self
+            .retry
+            .rerun
+            .then(|| resolve_rerun_source(self))
+            .transpose()?;
+        let retained_invocation = match &rerun {
+            Some(rerun) => load_invocation(&rerun.job)?,
+            None => None,
+        };
+        let legacy = rerun
+            .as_ref()
+            .map(|rerun| load_legacy_job_config(&rerun.job))
+            .transpose()?;
+        let task_paths = match &rerun {
+            Some(rerun) => rerun.tasks.clone(),
+            None => load_task_paths(self.tasks.clone(), self.suites.clone())?,
+        };
+        let output = self.output.clone().unwrap_or_else(|| {
+            rerun
+                .as_ref()
+                .and_then(|rerun| rerun.job.parent())
+                .map_or_else(
+                    || PathBuf::from(DEFAULT_OUTPUT_DIRECTORY),
+                    Path::to_path_buf,
+                )
+        });
+        let retained_thinking = retained_invocation
+            .as_ref()
+            .map(|invocation| {
+                Thinking::from_str(&invocation.thinking).map_err(|error| {
+                    eyre!(
+                        "invalid thinking level {:?} in {INVOCATION_FILE}: {error}",
+                        invocation.thinking
+                    )
+                })
+            })
+            .transpose()?;
+        let legacy_thinking = legacy.as_ref().map(LegacyJobConfig::thinking).transpose()?;
+        let thinking = self
+            .agent
+            .thinking()
+            .or(retained_thinking)
+            .or(legacy_thinking)
+            .unwrap_or_default();
+        let vm_rootfs = self.vm_rootfs.clone().or_else(|| {
+            retained_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.vm_rootfs.clone())
+        });
+        let vm = self.vm
+            || retained_invocation
+                .as_ref()
+                .is_some_and(|invocation| invocation.vm)
+            || rerun
+                .as_ref()
+                .is_some_and(|rerun| retained_job_used_vm(&rerun.job));
+        Ok(ResolvedRun {
+            task_paths,
+            output,
+            trials: self.trials.unwrap_or(1),
+            concurrency: self
+                .concurrency
+                .or_else(|| {
+                    retained_invocation
+                        .as_ref()
+                        .map(|invocation| invocation.concurrency)
+                })
+                .or_else(|| {
+                    legacy
+                        .as_ref()
+                        .and_then(|legacy| u16::try_from(legacy.n_concurrent_trials).ok())
+                })
+                .unwrap_or(1),
+            max_memory_mb: self.max_memory_mb.or_else(|| {
+                retained_invocation
+                    .as_ref()
+                    .and_then(|invocation| invocation.max_memory_mb)
+            }),
+            vm,
+            vm_rootfs,
+            vm_retention: self
+                .vm_retention
+                .or_else(|| {
+                    retained_invocation
+                        .as_ref()
+                        .map(|invocation| invocation.vm_retention)
+                })
+                .unwrap_or_default(),
+            thinking,
+            rerun_from: rerun.map(|rerun| rerun.job),
+        })
+    }
+
     pub(crate) async fn run(self) -> Result<()> {
         let total_started = Instant::now();
+        let resolved = self.resolve_run()?;
+        if self.retry.list {
+            return write_task_names(&resolved.task_paths, self.json);
+        }
         let observability_started = Instant::now();
         let _observability = self.observability.install()?;
         let observability = observability_started.elapsed();
-        let task_loading_started = Instant::now();
-        let tasks = load_tasks(self.tasks, self.suites)?;
-        let task_loading = task_loading_started.elapsed();
-        let vmm = std::env::current_exe()?;
-        let vm_runtime_started = Instant::now();
-        let runtime_image = prepare_runtime_for_vm(self.vm, self.vm_rootfs.as_deref()).await?;
-        let vm_runtime = vm_runtime_started.elapsed();
-        let gvproxy = prepare_network_for_vm(self.vm || self.vm_rootfs.is_some()).await?;
+        let (tasks, task_loading) =
+            load_prioritized_tasks(resolved.task_paths.clone(), &resolved.output)?;
+        let (vmm, runtime_image, vm_runtime) =
+            prepare_run_vm(resolved.vm, resolved.vm_rootfs.as_deref()).await?;
+        let gvproxy = prepare_network_for_vm(resolved.vm || resolved.vm_rootfs.is_some()).await?;
         let vm_environments_started = Instant::now();
         let vm_environments = selected_vm_environments(
             &tasks,
-            self.vm,
-            self.vm_rootfs,
+            resolved.vm,
+            resolved.vm_rootfs.clone(),
             self.vm_refresh,
             &vmm,
             &runtime_image,
@@ -111,16 +370,18 @@ impl Eval {
         .await?;
         let vm_environments_duration = vm_environments_started.elapsed();
         let evaluation_setup_started = Instant::now();
-        let nanocodex = self.agent.builder()?;
+        let nanocodex = self.agent.builder(resolved.thinking)?;
         let sweep = Sweep::builder()
             .tasks(tasks)
-            .trials(self.trials)
+            .trials(resolved.trials)
             .agent("default", nanocodex.clone())?
             .build()?;
         let attempt_count = sweep.attempt_count();
-        let mut evaluator = Nanoeval::builder(nanocodex)
-            .output_directory(self.output)
-            .max_concurrency(usize::from(self.concurrency));
+        let evaluator = Nanoeval::builder(nanocodex)
+            .output_directory(&resolved.output)
+            .max_concurrency(usize::from(resolved.concurrency));
+        let evaluator = configure_memory_limit(evaluator, resolved.max_memory_mb);
+        let mut evaluator = bind_finite_run(evaluator, &sweep, self.lifecycle.new_job);
         if let Some(environments) = vm_environments {
             let gvproxy = gvproxy.ok_or_else(|| eyre!("VM network backend was not prepared"))?;
             evaluator = evaluator.attempt_agent(move |attempt, builder| {
@@ -133,7 +394,7 @@ impl Eval {
                         runtime_image: &runtime_image,
                         vmm: &vmm,
                         gvproxy: &gvproxy,
-                        retain_passed_rootfs: self.vm_retention.retains_passes(),
+                        retain_passed_rootfs: resolved.vm_retention.retains_passes(),
                     },
                     attempt,
                 )?;
@@ -143,26 +404,30 @@ impl Eval {
             });
         }
         let (eval, events) = evaluator.build()?;
+        persist_invocation(eval.directory(), &resolved.invocation())?;
+        let remaining_attempts = eval.remaining_attempts(&sweep)?;
+        let skipped_attempts = attempt_count.saturating_sub(remaining_attempts);
+        report_resume(&eval, skipped_attempts, attempt_count);
         let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
         let progress = tokio::spawn(report_progress(
             events.subscribe(),
-            attempt_count,
-            usize::from(self.concurrency),
+            remaining_attempts,
+            usize::from(resolved.concurrency),
+            resolved.max_memory_mb,
         ));
         let evaluation_setup = evaluation_setup_started.elapsed();
         let attempts_started = Instant::now();
         let sweep_result = eval.sweep(sweep).await;
         let attempts = attempts_started.elapsed();
-        let harbor_finish_started = Instant::now();
-        let job = harbor.finish_all(attempt_count).await?;
-        let progress = progress.await??;
-        let (results, run_error) = match sweep_result {
-            Ok(results) => (results.into_results(), None),
-            Err(error) => (progress.scored_results(), Some(error)),
-        };
-        let harbor_finish = harbor_finish_started.elapsed();
+        let finished =
+            finish_evaluation(harbor, remaining_attempts, progress, sweep_result).await?;
         let output_started = Instant::now();
-        Self::write_report(&job, progress.outcomes, self.json)?;
+        Self::write_report(
+            &finished.job,
+            finished.outcomes,
+            skipped_attempts,
+            self.json,
+        )?;
         let output = output_started.elapsed();
         RunMeasurements {
             observability,
@@ -171,19 +436,22 @@ impl Eval {
             vm_environments: vm_environments_duration,
             evaluation_setup,
             attempts,
-            harbor_finish,
+            harbor_finish: finished.harbor_finish,
             output,
             total: total_started.elapsed(),
         }
-        .record(&results, attempt_count, progress.failed);
-        if let Some(error) = run_error {
-            return Err(error.into());
-        }
-        Ok(())
+        .record(&finished.results, attempt_count, finished.failed);
+        record_last_run(finished.job.directory())?;
+        finish_run(finished.run_error)
     }
 
-    fn write_report(job: &HarborJob, outcomes: Vec<AttemptOutcome>, json: bool) -> Result<()> {
-        let report = RunReport::new(job, outcomes);
+    fn write_report(
+        job: &HarborJob,
+        outcomes: Vec<AttemptOutcome>,
+        skipped: usize,
+        json: bool,
+    ) -> Result<()> {
+        let report = RunReport::new(job, outcomes, skipped);
         if json {
             serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
             println!();
@@ -203,6 +471,13 @@ impl Eval {
             report.summary.total
         );
         println!("Harbor job: {}", report.job_directory.display());
+        if report.skipped > 0 {
+            println!(
+                "Resumed: {} previously completed attempt{} retained",
+                report.skipped,
+                if report.skipped == 1 { "" } else { "s" }
+            );
+        }
         if report.summary.failed + report.summary.refused + report.summary.errored > 0 {
             println!(
                 "Inspect failures: nanoeval inspect {}",
@@ -212,7 +487,515 @@ impl Eval {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+impl ResolvedRun {
+    fn invocation(&self) -> RunInvocation {
+        RunInvocation {
+            version: INVOCATION_VERSION,
+            trials: self.trials,
+            concurrency: self.concurrency,
+            max_memory_mb: self.max_memory_mb,
+            vm: self.vm,
+            vm_rootfs: self.vm_rootfs.clone(),
+            vm_retention: self.vm_retention,
+            thinking: self.thinking.to_string(),
+            rerun_from: self.rerun_from.clone(),
+        }
+    }
+}
+
+impl LegacyJobConfig {
+    fn thinking(&self) -> Result<Thinking> {
+        let effort = self
+            .agents
+            .first()
+            .ok_or_else(|| eyre!("retained job config contains no agent"))?
+            .kwargs
+            .effort
+            .as_str();
+        Thinking::from_str(effort).map_err(|error| eyre!(error))
+    }
+}
+
+fn resolve_rerun_source(eval: &Eval) -> Result<RerunSelection> {
+    let job = match &eval.retry.rerun_from {
+        Some(job) => resolve_job_path(job, eval.output.as_deref())?,
+        None => latest_completed_job(eval.output.as_deref())?,
+    };
+    if !job.join("result.json").is_file() {
+        return Err(eyre!(
+            "rerun source is not a completed Nanoeval job: {}",
+            job.display()
+        ));
+    }
+    let matcher = retry_matcher(&eval.retry)?;
+    let queue = retained_retry_task_names(
+        &job,
+        eval.retry.statuses.include_refused,
+        eval.retry.statuses.include_errored,
+        matcher.as_ref(),
+    )?;
+    let tasks = retained_retry_task_roots(&queue.lineage, &queue.task_names)?;
+    if tasks.is_empty() {
+        let filter = if eval.retry.match_task.is_empty() && eval.retry.names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " matching names {:?} or regular expressions {:?}",
+                eval.retry.names, eval.retry.match_task
+            )
+        };
+        return Err(eyre!(
+            "no unresolved tasks{filter}; inspect the queue with `nanoeval run --rerun --list`"
+        ));
+    }
+    eprintln!(
+        "{}",
+        retry_selection_summary(eval, &queue, &job, tasks.len())
+    );
+    if !eval.retry.list && !eval.json {
+        for task in &tasks {
+            eprintln!("  {}", short_task_name(Task::load(task)?.name()));
+        }
+    }
+    Ok(RerunSelection { job, tasks })
+}
+
+fn retry_matcher(retry: &RetryArgs) -> Result<Option<RegexSet>> {
+    let mut patterns = retry.match_task.clone();
+    patterns.extend(retry.names.iter().map(|name| regex::escape(name)));
+    (!patterns.is_empty())
+        .then(|| RegexSet::new(patterns))
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn retry_selection_summary(
+    eval: &Eval,
+    queue: &RetainedRetryQueue,
+    job: &Path,
+    selected: usize,
+) -> String {
+    let run = if queue.lineage.len() == 1 {
+        "run"
+    } else {
+        "runs"
+    };
+    let job = job
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<job>");
+    if eval.retry.list {
+        if selected == queue.unresolved_tasks {
+            format!(
+                "{} unresolved task{} across {} {run} (latest {job})",
+                queue.unresolved_tasks,
+                if queue.unresolved_tasks == 1 { "" } else { "s" },
+                queue.lineage.len()
+            )
+        } else {
+            format!(
+                "{selected} selected of {} unresolved tasks across {} {run} (latest {job})",
+                queue.unresolved_tasks,
+                queue.lineage.len()
+            )
+        }
+    } else {
+        format!(
+            "Retrying {selected} of {} unresolved task{} across {} {run} (latest {job})",
+            queue.unresolved_tasks,
+            if queue.unresolved_tasks == 1 { "" } else { "s" },
+            queue.lineage.len()
+        )
+    }
+}
+
+fn write_task_names(tasks: &[PathBuf], json: bool) -> Result<()> {
+    let names = tasks
+        .iter()
+        .map(|task| Task::load(task).map(|task| task.name().to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if json {
+        serde_json::to_writer_pretty(io::stdout().lock(), &names)?;
+        println!();
+    } else {
+        for name in names {
+            println!("{}", short_task_name(&name));
+        }
+    }
+    Ok(())
+}
+
+fn short_task_name(name: &str) -> &str {
+    name.rsplit_once('/').map_or(name, |(_, name)| name)
+}
+
+fn latest_completed_job(output: Option<&Path>) -> Result<PathBuf> {
+    if let Ok(retained) = read_json::<LastRun>(Path::new(LAST_RUN_FILE))
+        && let Ok(job) = resolve_job_path(&retained.job, output)
+        && job.join("result.json").is_file()
+    {
+        return Ok(job);
+    }
+    let current = std::env::current_dir()?;
+    let mut roots = vec![output.map_or_else(|| current.clone(), Path::to_path_buf)];
+    if output.is_none() {
+        roots.extend(
+            fs::read_dir(&current)?
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_type().ok()?.is_dir().then_some(entry.path())),
+        );
+    }
+    let mut candidates = Vec::new();
+    for root in roots {
+        collect_completed_job(&root, &mut candidates);
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                collect_completed_job(&entry.path(), &mut candidates);
+            }
+        }
+    }
+    candidates.sort_unstable_by_key(|(started_at, _)| *started_at);
+    candidates.pop().map(|(_, job)| job).ok_or_else(|| {
+        eyre!("no completed Nanoeval job was found; run an eval or pass --rerun-from <JOB>")
+    })
+}
+
+fn collect_completed_job(directory: &Path, candidates: &mut Vec<(DateTime<Utc>, PathBuf)>) {
+    if !directory.join("result.json").is_file() || !directory.join("run.json").is_file() {
+        return;
+    }
+    let Ok(identity) = read_json::<RetainedJobIdentity>(&directory.join("job.json")) else {
+        return;
+    };
+    let Ok(directory) = fs::canonicalize(directory) else {
+        return;
+    };
+    candidates.push((identity.started_at, directory));
+}
+
+fn resolve_job_path(job: &Path, output: Option<&Path>) -> Result<PathBuf> {
+    let candidate = if job.is_dir() {
+        job.to_path_buf()
+    } else if job.components().count() == 1 {
+        output
+            .unwrap_or_else(|| Path::new(DEFAULT_OUTPUT_DIRECTORY))
+            .join(job)
+    } else {
+        job.to_path_buf()
+    };
+    fs::canonicalize(&candidate).map_err(|error| {
+        eyre!(
+            "Nanoeval job does not exist: {}: {error}",
+            candidate.display()
+        )
+    })
+}
+
+fn retained_retry_task_names(
+    job: &Path,
+    include_refused: bool,
+    include_errored: bool,
+    matcher: Option<&RegexSet>,
+) -> Result<RetainedRetryQueue> {
+    let lineage = retained_retry_lineage(job)?;
+    let mut statuses = BTreeMap::new();
+    for job in &lineage {
+        for (task_name, status) in retained_task_statuses(job)? {
+            statuses.insert(task_name, status);
+        }
+    }
+    let retryable_names = statuses
+        .into_iter()
+        .filter_map(|(task_name, status)| {
+            let retryable = match status {
+                RetainedTrialStatus::Failed => true,
+                RetainedTrialStatus::Refused => include_refused,
+                RetainedTrialStatus::Errored => include_errored,
+                RetainedTrialStatus::Passed => false,
+            };
+            retryable.then_some(task_name)
+        })
+        .collect::<BTreeSet<_>>();
+    let unresolved_tasks = retryable_names.len();
+    let task_names = retryable_names
+        .into_iter()
+        .filter(|task_name| matcher.is_none_or(|matcher| matcher.is_match(task_name)))
+        .collect();
+    Ok(RetainedRetryQueue {
+        task_names,
+        unresolved_tasks,
+        lineage,
+    })
+}
+
+fn retained_retry_task_roots(
+    lineage: &[PathBuf],
+    selected_names: &BTreeSet<String>,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = BTreeMap::new();
+    for job in lineage {
+        let retained: RetainedRun = read_json(&job.join("run.json"))?;
+        for retained_task in retained.tasks {
+            let task = Task::load(&retained_task.root)?;
+            if selected_names.contains(task.name()) {
+                roots.insert(task.name().to_owned(), retained_task.root);
+            }
+        }
+    }
+    let missing = selected_names
+        .iter()
+        .filter(|name| !roots.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(eyre!(
+            "retry lineage does not retain task definitions for {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(roots.into_values().collect())
+}
+
+fn retained_retry_lineage(job: &Path) -> Result<Vec<PathBuf>> {
+    let mut current = fs::canonicalize(job)?;
+    let mut seen = BTreeSet::new();
+    let mut lineage = Vec::new();
+    loop {
+        if !seen.insert(current.clone()) {
+            return Err(eyre!(
+                "retry lineage contains a cycle at {}",
+                current.display()
+            ));
+        }
+        lineage.push(current.clone());
+        let Some(parent) = load_invocation(&current)?.and_then(|invocation| invocation.rerun_from)
+        else {
+            break;
+        };
+        current = fs::canonicalize(&parent).map_err(|error| {
+            eyre!(
+                "retry parent {} recorded by {} is unavailable: {error}",
+                parent.display(),
+                current.join(INVOCATION_FILE).display()
+            )
+        })?;
+    }
+    lineage.reverse();
+    Ok(lineage)
+}
+
+fn retained_task_statuses(job: &Path) -> Result<BTreeMap<String, RetainedTrialStatus>> {
+    let mut statuses: BTreeMap<String, RetainedTrialStatus> = BTreeMap::new();
+    for entry in fs::read_dir(job)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let result_path = entry.path().join("result.json");
+        if !result_path.is_file() {
+            continue;
+        }
+        let result: RetainedTrialResult = read_json(&result_path)?;
+        let status = result.status();
+        statuses
+            .entry(result.task_name)
+            .and_modify(|retained| *retained = retained.merge(status))
+            .or_insert(status);
+    }
+    Ok(statuses)
+}
+
+impl RetainedTrialResult {
+    fn status(&self) -> RetainedTrialStatus {
+        if let Some(exception) = &self.exception_info {
+            return if exception.exception_type == "AgentSafetyRefusalError" {
+                RetainedTrialStatus::Refused
+            } else {
+                RetainedTrialStatus::Errored
+            };
+        }
+        if self
+            .verifier_result
+            .as_ref()
+            .is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0))
+        {
+            RetainedTrialStatus::Passed
+        } else {
+            RetainedTrialStatus::Failed
+        }
+    }
+}
+
+impl RetainedTrialStatus {
+    const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Errored, _) | (_, Self::Errored) => Self::Errored,
+            (Self::Refused, _) | (_, Self::Refused) => Self::Refused,
+            (Self::Passed, Self::Passed) => Self::Passed,
+        }
+    }
+}
+
+fn load_invocation(job: &Path) -> Result<Option<RunInvocation>> {
+    let path = job.join(INVOCATION_FILE);
+    match fs::read(&path) {
+        Ok(contents) => {
+            let invocation: RunInvocation = serde_json::from_slice(&contents)?;
+            if invocation.version != INVOCATION_VERSION {
+                return Err(eyre!(
+                    "unsupported Nanoeval invocation version {} in {}",
+                    invocation.version,
+                    path.display()
+                ));
+            }
+            Ok(Some(invocation))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_legacy_job_config(job: &Path) -> Result<LegacyJobConfig> {
+    read_json(&job.join("config.json"))
+}
+
+fn retained_job_used_vm(job: &Path) -> bool {
+    fs::read_dir(job).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().join("rootfs.ext4").is_file())
+    })
+}
+
+fn persist_invocation(job: &Path, invocation: &RunInvocation) -> Result<()> {
+    let path = job.join(INVOCATION_FILE);
+    if path.is_file() {
+        let retained: RunInvocation = read_json(&path)?;
+        if retained != *invocation {
+            return Err(eyre!(
+                "retry invocation conflicts with durable {}",
+                path.display()
+            ));
+        }
+        return Ok(());
+    }
+    write_json_atomic(&path, invocation)
+}
+
+fn record_last_run(job: &Path) -> Result<()> {
+    let job = fs::canonicalize(job)?;
+    write_json_atomic(Path::new(LAST_RUN_FILE), &LastRun { job })
+}
+
+fn read_json<T>(path: &Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre!("JSON path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, value)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
+fn report_resume(eval: &Nanoeval, skipped: usize, total: usize) {
+    if eval.resumed() {
+        eprintln!(
+            "Resuming Harbor job {} ({skipped} of {total} attempts already durable)",
+            eval.directory().display(),
+        );
+    }
+}
+
+fn finish_run(error: Option<nanoeval::EvalError>) -> Result<()> {
+    error.map_or(Ok(()), |error| Err(error.into()))
+}
+
+fn load_prioritized_tasks(
+    task_paths: Vec<PathBuf>,
+    output: &Path,
+) -> Result<(Vec<Task>, Duration)> {
+    let started_at = Instant::now();
+    let mut tasks = load_tasks(task_paths, Vec::new())?;
+    prioritize_tasks(&mut tasks, output)?;
+    Ok((tasks, started_at.elapsed()))
+}
+
+async fn prepare_run_vm(vm: bool, rootfs: Option<&Path>) -> Result<(PathBuf, PathBuf, Duration)> {
+    let vmm = std::env::current_exe()?;
+    let started_at = Instant::now();
+    let runtime = prepare_runtime_for_vm(vm, rootfs).await?;
+    Ok((vmm, runtime, started_at.elapsed()))
+}
+
+struct FinishedEvaluation {
+    job: HarborJob,
+    outcomes: Vec<AttemptOutcome>,
+    results: Vec<EvalResult>,
+    run_error: Option<nanoeval::EvalError>,
+    failed: usize,
+    harbor_finish: Duration,
+}
+
+async fn finish_evaluation(
+    harbor: HarborRecorder,
+    remaining_attempts: usize,
+    progress: tokio::task::JoinHandle<Result<Progress>>,
+    sweep_result: Result<SweepResults, nanoeval::EvalError>,
+) -> Result<FinishedEvaluation> {
+    let started_at = Instant::now();
+    let job = harbor.finish_all(remaining_attempts).await?;
+    let progress = progress.await??;
+    let (results, run_error) = match sweep_result {
+        Ok(results) => (results.into_results(), None),
+        Err(error) => (progress.scored_results(), Some(error)),
+    };
+    Ok(FinishedEvaluation {
+        job,
+        outcomes: progress.outcomes,
+        results,
+        run_error,
+        failed: progress.failed,
+        harbor_finish: started_at.elapsed(),
+    })
+}
+
+fn bind_finite_run(evaluator: NanoevalBuilder, sweep: &Sweep, fresh: bool) -> NanoevalBuilder {
+    if fresh {
+        evaluator.fresh_run(sweep)
+    } else {
+        evaluator.resume_incomplete(sweep)
+    }
+}
+
+fn configure_memory_limit(
+    evaluator: NanoevalBuilder,
+    max_memory_mb: Option<u64>,
+) -> NanoevalBuilder {
+    match max_memory_mb {
+        Some(max_memory_mb) => evaluator.max_memory_mb(max_memory_mb),
+        None => evaluator,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 enum VmRetention {
     /// Retain disks only for failures, refusals, and errors.
     #[default]
@@ -233,6 +1016,86 @@ fn load_tasks(paths: Vec<PathBuf>, suites: Vec<PathBuf>) -> Result<Vec<Task>> {
         .map(Task::load)
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn prioritize_tasks(tasks: &mut [Task], output: &Path) -> Result<()> {
+    let estimates = retained_task_durations(output)?;
+    tasks.sort_by_key(|task| {
+        let declared_floor = task
+            .agent_timeout()
+            .div_f64(4.0)
+            .min(Duration::from_secs(600));
+        let estimate = estimates
+            .get(task.name())
+            .copied()
+            .unwrap_or(declared_floor);
+        Reverse((estimate, task.agent_timeout(), task.verifier().timeout()))
+    });
+    Ok(())
+}
+
+fn retained_task_durations(output: &Path) -> Result<BTreeMap<String, Duration>> {
+    let jobs = match fs::read_dir(output) {
+        Ok(jobs) => jobs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut samples = BTreeMap::<String, Vec<Duration>>::new();
+    for job in jobs {
+        let job = job?;
+        if !job.file_type()?.is_dir() {
+            continue;
+        }
+        for trial in fs::read_dir(job.path())? {
+            let trial = trial?;
+            if !trial.file_type()?.is_dir() {
+                continue;
+            }
+            let Ok(bytes) = fs::read(trial.path().join("result.json")) else {
+                continue;
+            };
+            let Ok(result) = serde_json::from_slice::<RetainedTrialTiming>(&bytes) else {
+                continue;
+            };
+            if result.exception_info.as_ref().is_some_and(|exception| {
+                matches!(
+                    exception.exception_type.as_str(),
+                    "EnvironmentError" | "VerifierError" | "NanoevalError"
+                )
+            }) {
+                continue;
+            }
+            let Ok(duration) = result
+                .finished_at
+                .signed_duration_since(result.started_at)
+                .to_std()
+            else {
+                continue;
+            };
+            samples.entry(result.task_name).or_default().push(duration);
+        }
+    }
+    Ok(samples
+        .into_iter()
+        .map(|(task, mut durations)| {
+            durations.sort_unstable();
+            let median = durations[durations.len() / 2];
+            (task, median)
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct RetainedTrialTiming {
+    task_name: String,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    exception_info: Option<RetainedException>,
+}
+
+#[derive(Deserialize)]
+struct RetainedException {
+    exception_type: String,
 }
 
 pub(crate) fn load_task_paths(
@@ -453,6 +1316,7 @@ const VERIFIER_SETUP_MARKER: &str = "# Check if we're in a valid working directo
 const VERIFIER_CACHE_BLOCK_ID: &str = "nanoeval-verifier-cache";
 const VERIFIER_CACHE_BLOCK_DEVICE: &str = "/dev/vdc";
 const VERIFIER_CACHE_MOUNT: &str = "/run/nanoeval-verifier-cache";
+const CACHED_VERIFIER_SCRIPT: &str = "/tmp/nanoeval-verifier.sh";
 
 #[derive(Clone)]
 struct VmEnvironment {
@@ -792,7 +1656,8 @@ struct VerifierCache {
     root: PathBuf,
     key: String,
     status: &'static str,
-    script_offset: usize,
+    cacheable_start: usize,
+    cacheable_end: usize,
     disk_bytes: u64,
 }
 
@@ -1028,7 +1893,8 @@ impl VerifierCache {
             root,
             key,
             status,
-            script_offset: setup.len(),
+            cacheable_start: setup.cacheable_start,
+            cacheable_end: setup.cacheable_end,
             disk_bytes,
         }))
     }
@@ -1097,21 +1963,47 @@ fn verifier_cache_populated(disk: &Path) -> io::Result<bool> {
     Ok(reader.exists("/uv-home/bin/env") && reader.exists("/uv-home/bin/uv"))
 }
 
-fn recognized_verifier_setup(script: &[u8]) -> Option<&[u8]> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecognizedVerifierSetup {
+    cacheable_start: usize,
+    cacheable_end: usize,
+}
+
+fn recognized_verifier_setup(script: &[u8]) -> Option<RecognizedVerifierSetup> {
     let script = std::str::from_utf8(script).ok()?;
     let marker = script.find(VERIFIER_SETUP_MARKER)?;
     let setup = &script[..marker];
-    let mut cursor = 0;
-    for required in [
-        "apt-get update",
-        "apt-get install -y curl",
-        "https://astral.sh/uv/0.9.5/install.sh",
-        "source $HOME/.local/bin/env",
-    ] {
-        let offset = setup[cursor..].find(required)?;
-        cursor += offset + required.len();
+    let commands = setup
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    if commands
+        != [
+            "apt-get update",
+            "apt-get install -y curl",
+            "curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh",
+            "source $HOME/.local/bin/env",
+        ]
+    {
+        return None;
     }
-    Some(setup.as_bytes())
+    let cacheable_start = script
+        .strip_prefix("#!")
+        .and_then(|script| script.find('\n'))
+        .map_or(0, |offset| offset + 3);
+    Some(RecognizedVerifierSetup {
+        cacheable_start,
+        cacheable_end: marker,
+    })
+}
+
+fn cached_verifier_script(script: &[u8], setup: RecognizedVerifierSetup) -> Vec<u8> {
+    let mut cached = Vec::with_capacity(script.len());
+    cached.extend_from_slice(&script[..setup.cacheable_start]);
+    cached.extend_from_slice(b"\nsource /root/.local/bin/env\n");
+    cached.extend_from_slice(&script[setup.cacheable_end..]);
+    cached
 }
 
 impl AttemptVerifier for VmVerifier {
@@ -1158,8 +2050,10 @@ impl VmVerifier {
         if self.attempt_cache.is_some() {
             self.mount_verifier_cache(&agent_session).await?;
         }
+        self.stage_cached_verifier(&agent_session, task).await?;
         let command = self.verifier_command(task, self.attempt_cache.as_ref())?;
-        let output = agent_session.command(command).await?;
+        let (output, verifier_timed_out) =
+            Self::execute_verifier_command(&agent_session, command).await?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let combined = match (stdout.is_empty(), stderr.is_empty()) {
@@ -1168,7 +2062,11 @@ impl VmVerifier {
             (false, false) => format!("{stdout}\n{stderr}"),
         };
         fs::write(verifier_directory.join("test-stdout.txt"), combined)?;
-        let reward_bytes = agent_session.read_file("/logs/verifier/reward.txt").await?;
+        let reward_bytes = if verifier_timed_out {
+            b"0\n".to_vec()
+        } else {
+            agent_session.read_file("/logs/verifier/reward.txt").await?
+        };
         fs::write(verifier_directory.join("reward.txt"), &reward_bytes)?;
         if let Ok(ctrf) = agent_session.read_file("/logs/verifier/ctrf.json").await {
             fs::write(verifier_directory.join("ctrf.json"), ctrf)?;
@@ -1228,6 +2126,58 @@ impl VmVerifier {
         })
     }
 
+    async fn execute_verifier_command(
+        session: &VmToolSession,
+        command: VmCommand,
+    ) -> Result<(VmCommandOutput, bool), VmAttemptError> {
+        match session.command(command).await {
+            Ok(output) => Ok((output, false)),
+            Err(VmToolSessionError::GuestTimeout(timeout)) => Ok((
+                VmCommandOutput {
+                    exit_code: 124,
+                    stdout: Vec::new(),
+                    stderr: format!(
+                        "canonical verifier exceeded its {timeout:?} deadline; \
+                         the candidate is scored with reward 0\n"
+                    )
+                    .into_bytes(),
+                },
+                true,
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn stage_cached_verifier(
+        &self,
+        session: &VmToolSession,
+        task: &Task,
+    ) -> Result<(), VmAttemptError> {
+        if !self
+            .attempt_cache
+            .as_ref()
+            .is_some_and(|cache| cache.skip_setup)
+        {
+            return Ok(());
+        }
+        let cache = self
+            .cache
+            .as_ref()
+            .ok_or_else(|| io::Error::other("verifier cache metadata is missing"))?;
+        let script = fs::read(task.verifier().script())?;
+        let cached = cached_verifier_script(
+            &script,
+            RecognizedVerifierSetup {
+                cacheable_start: cache.cacheable_start,
+                cacheable_end: cache.cacheable_end,
+            },
+        );
+        session
+            .write_file(CACHED_VERIFIER_SCRIPT, cached, 0o700)
+            .await?;
+        Ok(())
+    }
+
     async fn mount_verifier_cache(&self, session: &VmToolSession) -> Result<(), VmAttemptError> {
         let output = session
             .command(
@@ -1261,18 +2211,15 @@ impl VmVerifier {
                 .cache
                 .as_ref()
                 .ok_or_else(|| io::Error::other("verifier cache metadata is missing"))?;
-            let offset = cache.script_offset + 1;
             info!(
                 target: "nanoeval",
                 verifier_cache_key = cache.key,
-                verifier_setup_bytes_skipped = offset - 1,
-                "running canonical verifier from its cached post-setup boundary"
+                verifier_setup_bytes_skipped = cache.cacheable_end - cache.cacheable_start,
+                verifier_system_setup_bytes = cache.cacheable_start,
+                "running canonical verifier with only persisted setup omitted"
             );
             VmCommand::new(verifier_shell(&self.launch.shell, skip_setup))
-                .arg("-c")
-                .arg("source /root/.local/bin/env && tail -c +\"$1\" /tests/test.sh | /bin/bash")
-                .arg("nanoeval-verifier")
-                .arg(offset.to_string())
+                .arg(CACHED_VERIFIER_SCRIPT)
         } else {
             VmCommand::new(verifier_shell(&self.launch.shell, skip_setup)).arg("/tests/test.sh")
         };
@@ -1420,16 +2367,18 @@ fn copy_root_entries(source: &Path, destination: &Path, root: bool) -> Result<()
 struct RunReport {
     job_id: uuid::Uuid,
     job_directory: PathBuf,
+    skipped: usize,
     summary: RunSummary,
     attempts: Vec<AttemptOutcome>,
 }
 
 impl RunReport {
-    fn new(job: &HarborJob, mut attempts: Vec<AttemptOutcome>) -> Self {
+    fn new(job: &HarborJob, mut attempts: Vec<AttemptOutcome>, skipped: usize) -> Self {
         attempts.sort_by(|left, right| left.trial_name().cmp(right.trial_name()));
         Self {
             job_id: job.id(),
             job_directory: job.directory().to_path_buf(),
+            skipped,
             summary: RunSummary::from_attempts(&attempts),
             attempts,
         }
@@ -1519,11 +2468,17 @@ async fn report_progress(
     mut events: NanoevalEventStream,
     expected: usize,
     concurrency: usize,
+    max_memory_mb: Option<u64>,
 ) -> Result<Progress> {
-    eprintln!(
-        "Running {expected} evaluation{} (up to {concurrency} concurrent)",
-        if expected == 1 { "" } else { "s" }
-    );
+    let count = if expected == 1 { "" } else { "s" };
+    if let Some(max_memory_mb) = max_memory_mb {
+        eprintln!(
+            "Running {expected} evaluation{count} (up to {concurrency} concurrent, \
+             {max_memory_mb} MiB task-declared memory)"
+        );
+    } else {
+        eprintln!("Running {expected} evaluation{count} (up to {concurrency} concurrent)");
+    }
     let mut completed = 0;
     let mut outcomes = Vec::with_capacity(expected);
     let mut failed = 0;
@@ -1635,8 +2590,9 @@ mod tests {
     use nanoeval::Task;
 
     use super::{
-        Eval, load_tasks, load_vm_guest_runtime_record, recognized_verifier_setup,
-        remove_passed_rootfs, stage_vm_guest_runtime, verifier_shell,
+        CACHED_VERIFIER_SCRIPT, Eval, cached_verifier_script, load_tasks,
+        load_vm_guest_runtime_record, recognized_verifier_setup, remove_passed_rootfs,
+        retained_retry_task_names, retained_task_durations, stage_vm_guest_runtime, verifier_shell,
     };
 
     #[derive(Parser)]
@@ -1657,6 +2613,8 @@ mod tests {
             "5",
             "--concurrency",
             "10",
+            "--max-memory-mb",
+            "24576",
             "--vm",
         ])
         .unwrap();
@@ -1665,10 +2623,11 @@ mod tests {
             cli.eval.tasks,
             [PathBuf::from("tasks/first"), PathBuf::from("tasks/second")]
         );
-        assert_eq!(cli.eval.trials, 5);
-        assert_eq!(cli.eval.concurrency, 10);
+        assert_eq!(cli.eval.trials, Some(5));
+        assert_eq!(cli.eval.concurrency, Some(10));
+        assert_eq!(cli.eval.max_memory_mb, Some(24_576));
         assert!(cli.eval.vm);
-        assert!(!cli.eval.vm_retention.retains_passes());
+        assert!(!cli.eval.vm_retention.unwrap_or_default().retains_passes());
         assert!(cli.eval.suites.is_empty());
     }
 
@@ -1684,7 +2643,43 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(cli.eval.vm_retention.retains_passes());
+        assert!(cli.eval.vm_retention.unwrap().retains_passes());
+    }
+
+    #[test]
+    fn rerun_is_a_task_source_with_foundry_style_name_filters() {
+        let cli = TestCli::try_parse_from([
+            "nanoeval",
+            "--rerun",
+            "webserver",
+            "--rerun-from",
+            "job-id",
+            "--match-task",
+            "torch-.*",
+            "--match-task",
+            "mteb",
+            "--include-errored",
+            "--list",
+        ])
+        .unwrap();
+
+        assert!(cli.eval.retry.rerun);
+        assert_eq!(cli.eval.retry.rerun_from, Some(PathBuf::from("job-id")));
+        assert_eq!(cli.eval.retry.names, ["webserver"]);
+        assert_eq!(cli.eval.retry.match_task, ["torch-.*", "mteb"]);
+        assert!(cli.eval.retry.statuses.include_errored);
+        assert!(cli.eval.retry.list);
+        assert!(cli.eval.tasks.is_empty());
+        assert!(cli.eval.suites.is_empty());
+    }
+
+    #[test]
+    fn positional_rerun_names_are_literal_substrings() {
+        let cli = TestCli::try_parse_from(["nanoeval", "--rerun", "task.+", "--list"]).unwrap();
+        let matcher = super::retry_matcher(&cli.eval.retry).unwrap().unwrap();
+
+        assert!(matcher.is_match("terminal-bench/task.+example"));
+        assert!(!matcher.is_match("terminal-bench/taskXYZexample"));
     }
 
     #[test]
@@ -1719,6 +2714,130 @@ mod tests {
                 "nanoeval/uppercase-message",
                 "nanoeval/write-greeting"
             ]
+        );
+    }
+
+    #[test]
+    fn retained_task_duration_uses_the_median_completed_trial() {
+        let output = tempfile::tempdir().unwrap();
+        let job = output.path().join("job");
+        for (trial, finished_at) in [
+            ("first", "2026-07-23T00:00:10Z"),
+            ("second", "2026-07-23T00:00:30Z"),
+            ("third", "2026-07-23T00:00:20Z"),
+        ] {
+            let directory = job.join(trial);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("result.json"),
+                format!(
+                    r#"{{"task_name":"terminal-bench/example","started_at":"2026-07-23T00:00:00Z","finished_at":"{finished_at}"}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let estimates = retained_task_durations(output.path()).unwrap();
+        assert_eq!(
+            estimates["terminal-bench/example"],
+            std::time::Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn retry_selection_distinguishes_scores_refusals_and_errors() {
+        let job = tempfile::tempdir().unwrap();
+        for (trial, result) in [
+            (
+                "passed",
+                r#"{"task_name":"terminal-bench/passed","verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
+            ),
+            (
+                "partially-failed",
+                r#"{"task_name":"terminal-bench/partially-failed","verifier_result":{"rewards":{"first":1.0,"second":0.0}},"exception_info":null}"#,
+            ),
+            (
+                "failed",
+                r#"{"task_name":"terminal-bench/torch-failed","verifier_result":{"rewards":{"reward":0.0}},"exception_info":null}"#,
+            ),
+            (
+                "refused",
+                r#"{"task_name":"terminal-bench/refused","verifier_result":null,"exception_info":{"exception_type":"AgentSafetyRefusalError"}}"#,
+            ),
+            (
+                "errored",
+                r#"{"task_name":"terminal-bench/errored","verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
+            ),
+        ] {
+            let directory = job.path().join(trial);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("result.json"), result).unwrap();
+        }
+
+        let failed = retained_retry_task_names(job.path(), false, false, None).unwrap();
+        assert_eq!(
+            failed.task_names,
+            [
+                "terminal-bench/partially-failed".to_owned(),
+                "terminal-bench/torch-failed".to_owned()
+            ]
+            .into()
+        );
+
+        let matcher = regex::RegexSet::new(["torch|errored"]).unwrap();
+        let selected = retained_retry_task_names(job.path(), true, true, Some(&matcher)).unwrap();
+        assert_eq!(
+            selected.task_names,
+            [
+                "terminal-bench/errored".to_owned(),
+                "terminal-bench/torch-failed".to_owned()
+            ]
+            .into()
+        );
+    }
+
+    #[test]
+    fn retry_lineage_overlays_only_tasks_present_in_the_child_job() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("base");
+        let child = root.path().join("child");
+        for (job, trial, task, reward) in [
+            (&base, "first", "terminal-bench/first", 0.0),
+            (&base, "second", "terminal-bench/second", 0.0),
+            (&child, "first-retry", "terminal-bench/first", 1.0),
+        ] {
+            let directory = job.join(trial);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("result.json"),
+                format!(
+                    r#"{{"task_name":"{task}","verifier_result":{{"rewards":{{"reward":{reward}}}}},"exception_info":null}}"#
+                ),
+            )
+            .unwrap();
+        }
+        super::write_json_atomic(
+            &child.join(super::INVOCATION_FILE),
+            &super::RunInvocation {
+                version: super::INVOCATION_VERSION,
+                trials: 1,
+                concurrency: 1,
+                max_memory_mb: None,
+                vm: false,
+                vm_rootfs: None,
+                vm_retention: super::VmRetention::Failures,
+                thinking: "low".to_owned(),
+                rerun_from: Some(base.canonicalize().unwrap()),
+            },
+        )
+        .unwrap();
+
+        let queue = retained_retry_task_names(&child, false, false, None).unwrap();
+
+        assert_eq!(queue.lineage.len(), 2);
+        assert_eq!(
+            queue.task_names,
+            ["terminal-bench/second".to_owned()].into()
         );
     }
 
@@ -1778,17 +2897,32 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_the_pinned_apt_uv_verifier_setup() {
+    fn cached_verifier_omits_the_complete_pinned_uv_bootstrap() {
+        assert!(CACHED_VERIFIER_SCRIPT.starts_with("/tmp/"));
         let supported = br"#!/bin/bash
+# Install curl
 apt-get update
 apt-get install -y curl
+# Install uv
 curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
 source $HOME/.local/bin/env
 # Check if we're in a valid working directory
 uvx pytest
 ";
         let setup = recognized_verifier_setup(supported).unwrap();
-        assert!(!setup.windows(4).any(|window| window == b"uvx "));
+        assert_eq!(&supported[..setup.cacheable_start], b"#!/bin/bash\n");
+        let omitted = &supported[setup.cacheable_start..setup.cacheable_end];
+        assert!(omitted.windows(7).any(|window| window == b"apt-get"));
+        assert!(omitted.windows(9).any(|window| window == b"astral.sh"));
+        assert!(omitted.windows(7).any(|window| window == b"source "));
+        assert!(!omitted.windows(4).any(|window| window == b"uvx "));
+        let transformed = cached_verifier_script(supported, setup);
+        let transformed = std::str::from_utf8(&transformed).unwrap();
+        assert!(transformed.starts_with("#!/bin/bash\n"));
+        assert!(!transformed.contains("apt-get"));
+        assert!(transformed.contains("source /root/.local/bin/env"));
+        assert!(!transformed.contains("astral.sh"));
+        assert!(transformed.contains("uvx pytest"));
 
         assert!(recognized_verifier_setup(b"pip install pytest\npytest").is_none());
         assert!(
@@ -1796,6 +2930,19 @@ uvx pytest
                 br"apt-get update
 apt-get install -y curl
 curl -LsSf https://astral.sh/uv/latest/install.sh | sh
+source $HOME/.local/bin/env
+# Check if we're in a valid working directory
+"
+            )
+            .is_none()
+        );
+        assert!(
+            recognized_verifier_setup(
+                br"#!/bin/bash
+apt-get update
+apt-get install -y curl
+touch /root/extra-state
+curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
 source $HOME/.local/bin/env
 # Check if we're in a valid working directory
 "

@@ -5,7 +5,15 @@ binary=$1
 shift
 
 requires_hypervisor=false
-if [ "${1:-}" = vm ] && { [ "${2:-}" = run ] || [ "${2:-}" = prepare ]; }; then
+if [ "${1:-}" = run ]; then
+    requires_hypervisor=true
+    for argument in "$@"; do
+        if [ "$argument" = --list ]; then
+            requires_hypervisor=false
+            break
+        fi
+    done
+elif [ "${1:-}" = vm ] && { [ "${2:-}" = run ] || [ "${2:-}" = prepare ]; }; then
     requires_hypervisor=true
 else
     for argument in "$@"; do
@@ -31,12 +39,19 @@ signed_binary="$signed_directory/nanoeval"
 if [ ! -x "$signed_binary" ]; then
     mkdir -p "$signed_directory"
     temporary_binary="$signed_directory/nanoeval.$$.tmp"
+    codesign_log="$signed_directory/codesign.$$.log"
     cp "$binary" "$temporary_binary"
-    codesign \
+    if ! codesign \
         --entitlements "$entitlements" \
         --force \
         --sign - \
-        "$temporary_binary"
+        "$temporary_binary" >"$codesign_log" 2>&1
+    then
+        cat "$codesign_log" >&2
+        rm -f "$codesign_log" "$temporary_binary"
+        exit 1
+    fi
+    rm -f "$codesign_log"
     mv -f "$temporary_binary" "$signed_binary"
 fi
 

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -19,7 +19,7 @@ use nanocodex::{
 };
 use serde::Deserialize;
 use tokio::{
-    sync::{AcquireError, Semaphore, broadcast},
+    sync::{Notify, broadcast},
     time::timeout,
 };
 use tracing::{Instrument, Span, info, info_span};
@@ -50,17 +50,50 @@ pub struct NanoevalBuilder {
     nanocodex: NanocodexBuilder<StandardResponses>,
     output_directory: PathBuf,
     max_concurrency: usize,
+    max_memory_mb: Option<u64>,
     attempt_agent: Option<AttemptAgentFactory>,
+    finite_run: Option<FiniteRun>,
 }
 
 struct NanoevalInner {
     nanocodex: NanocodexBuilder<StandardResponses>,
     job: EvalJob,
-    concurrency: Arc<Semaphore>,
+    planned_attempts: Option<usize>,
+    admission: Arc<AdmissionController>,
     max_concurrency: usize,
+    max_memory_mb: Option<u64>,
     next_prompt_cache_attempt: AtomicU64,
     events: broadcast::Sender<Arc<EvalEvent>>,
     attempt_agent: Option<AttemptAgentFactory>,
+}
+
+struct AdmissionController {
+    max_concurrency: usize,
+    max_memory_mb: Option<u64>,
+    state: Mutex<AdmissionState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    running: usize,
+    memory_mb: u64,
+}
+
+struct AdmissionPermit {
+    controller: Arc<AdmissionController>,
+    memory_mb: u64,
+}
+
+struct FiniteRun {
+    manifest: crate::sweep::RunManifest,
+    mode: FiniteRunMode,
+}
+
+#[derive(Clone, Copy)]
+enum FiniteRunMode {
+    Fresh,
+    Resume,
 }
 
 type AttemptError = Box<dyn Error + Send + Sync + 'static>;
@@ -129,6 +162,9 @@ pub enum EvalError {
     #[error("maximum concurrency must be greater than zero")]
     InvalidConcurrency,
 
+    #[error("maximum task memory must be greater than zero")]
+    InvalidMemory,
+
     #[error("task {task} cannot run with the native backend: {reason}")]
     UnsupportedNativeTask { task: String, reason: &'static str },
 
@@ -162,11 +198,11 @@ pub enum EvalError {
     #[error("evaluation job is already bound to a different run: {0}")]
     RunConflict(PathBuf),
 
+    #[error("matching incomplete evaluation job is already active: {0}")]
+    RunActive(PathBuf),
+
     #[error("invalid verifier reward: {0}")]
     ParseReward(#[from] ParseFloatError),
-
-    #[error("Nanoeval's concurrency semaphore was unexpectedly closed")]
-    ConcurrencyClosed(#[from] AcquireError),
 
     #[error("sweep execution lost its task-agent-trial coordinates")]
     MissingSweepCoordinate,
@@ -179,7 +215,9 @@ impl Nanoeval {
             nanocodex: nanocodex.shared_prompt_cache(),
             output_directory: PathBuf::from("nanoeval-runs"),
             max_concurrency: 1,
+            max_memory_mb: None,
             attempt_agent: None,
+            finite_run: None,
         }
     }
 
@@ -189,7 +227,11 @@ impl Nanoeval {
     ///
     /// Returns an error when setup, the agent, or verification fails.
     pub async fn task(&self, task: Task) -> Result<EvalResult, EvalError> {
-        let _permit = Arc::clone(&self.inner.concurrency).acquire_owned().await?;
+        let _permit = self
+            .inner
+            .admission
+            .acquire(task.resources().memory_mb)
+            .await;
         self.run_task(AttemptInput {
             task,
             nanocodex: self.inner.nanocodex.clone(),
@@ -260,17 +302,22 @@ impl Nanoeval {
     /// Returns the first setup, agent, or verifier error.
     pub async fn sweep(&self, sweep: Sweep) -> Result<SweepResults, EvalError> {
         self.inner.job.bind_run(&sweep.manifest())?;
-        let inputs = sweep
-            .attempts()
-            .map(|attempt| AttemptInput {
+        let mut skipped = 0;
+        let mut inputs = Vec::new();
+        for attempt in sweep.attempts() {
+            if self.inner.job.completed_attempt(&attempt.trial_prefix())? {
+                skipped += 1;
+                continue;
+            }
+            inputs.push(AttemptInput {
                 task: attempt.task().clone(),
                 nanocodex: attempt.nanocodex().clone(),
                 coordinate: Some(SweepCoordinate {
                     agent: attempt.agent_id().clone(),
                     trial: attempt.trial(),
                 }),
-            })
-            .collect();
+            });
+        }
         let attempts = self
             .run_tasks(inputs)
             .await?
@@ -284,26 +331,47 @@ impl Nanoeval {
                 ))
             })
             .collect::<Result<Vec<_>, EvalError>>()?;
-        Ok(SweepResults::new(attempts))
+        Ok(SweepResults::new(attempts, skipped))
+    }
+
+    /// Returns how many attempts in `sweep` do not yet have a durable terminal
+    /// result in this evaluator's job directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the job is bound to another sweep or its retained
+    /// artifacts cannot be inspected.
+    pub fn remaining_attempts(&self, sweep: &Sweep) -> Result<usize, EvalError> {
+        self.inner.job.bind_run(&sweep.manifest())?;
+        let mut remaining = 0;
+        for attempt in sweep.attempts() {
+            if !self.inner.job.completed_attempt(&attempt.trial_prefix())? {
+                remaining += 1;
+            }
+        }
+        Ok(remaining)
     }
 
     async fn run_tasks(&self, tasks: Vec<AttemptInput>) -> Result<Vec<AttemptOutput>, EvalError> {
+        let scheduling_window = tasks
+            .len()
+            .min(self.inner.max_concurrency.saturating_mul(4))
+            .max(1);
         let evaluator = self.clone();
         let mut completed = stream::iter(tasks.into_iter().enumerate())
             .map(move |(index, input)| {
                 let evaluator = evaluator.clone();
                 async move {
-                    let result = async {
-                        let _permit = Arc::clone(&evaluator.inner.concurrency)
-                            .acquire_owned()
-                            .await?;
-                        evaluator.run_task(input).await
-                    }
-                    .await;
+                    let _permit = evaluator
+                        .inner
+                        .admission
+                        .acquire(input.task.resources().memory_mb)
+                        .await;
+                    let result = evaluator.run_task(input).await;
                     (index, result)
                 }
             })
-            .buffer_unordered(self.inner.max_concurrency);
+            .buffer_unordered(scheduling_window);
         let mut results = Vec::new();
         let mut first_error = None;
         while let Some((index, result)) = completed.next().await {
@@ -344,10 +412,29 @@ impl Nanoeval {
         self.inner.job.parent_directory()
     }
 
+    /// Returns whether this evaluator reopened an incomplete matching job.
+    #[must_use]
+    pub fn resumed(&self) -> bool {
+        self.inner.job.resumed()
+    }
+
+    /// Returns the finite attempt count fixed by `resume_incomplete`, when set.
+    #[must_use]
+    pub fn planned_attempts(&self) -> Option<usize> {
+        self.inner.planned_attempts
+    }
+
     /// Returns the maximum number of concurrently executing attempts.
     #[must_use]
     pub fn max_concurrency(&self) -> usize {
         self.inner.max_concurrency
+    }
+
+    /// Returns the optional ceiling on concurrently admitted task-declared
+    /// memory.
+    #[must_use]
+    pub fn max_memory_mb(&self) -> Option<u64> {
+        self.inner.max_memory_mb
     }
 
     async fn run_task(&self, input: AttemptInput) -> Result<AttemptOutput, EvalError> {
@@ -420,6 +507,7 @@ impl Nanoeval {
             );
             let trace_started = Instant::now();
             let result = span.in_scope(|| {
+                validate_attempt_environment(&task, self.inner.attempt_agent.is_some())?;
                 NativeAttempt::prepare(self.inner.job.directory(), &trial_name, &task)
             });
             record_span_result(&span, trace_started, &result);
@@ -658,9 +746,39 @@ impl NanoevalBuilder {
         self
     }
 
+    /// Reopens the newest incomplete job whose durable run manifest matches
+    /// `sweep`, or creates a new job when none exists.
+    #[must_use]
+    pub fn resume_incomplete(mut self, sweep: &Sweep) -> Self {
+        self.finite_run = Some(FiniteRun {
+            manifest: sweep.manifest(),
+            mode: FiniteRunMode::Resume,
+        });
+        self
+    }
+
+    /// Creates a new job already bound to `sweep`, even when a matching
+    /// incomplete job exists.
+    #[must_use]
+    pub fn fresh_run(mut self, sweep: &Sweep) -> Self {
+        self.finite_run = Some(FiniteRun {
+            manifest: sweep.manifest(),
+            mode: FiniteRunMode::Fresh,
+        });
+        self
+    }
+
     #[must_use]
     pub const fn max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.max_concurrency = max_concurrency;
+        self
+    }
+
+    /// Bounds the sum of task-declared memory for concurrently running
+    /// attempts. A task whose own declaration exceeds the ceiling runs alone.
+    #[must_use]
+    pub const fn max_memory_mb(mut self, max_memory_mb: u64) -> Self {
+        self.max_memory_mb = Some(max_memory_mb);
         self
     }
 
@@ -696,15 +814,39 @@ impl NanoevalBuilder {
         if self.max_concurrency == 0 {
             return Err(EvalError::InvalidConcurrency);
         }
-        let job = EvalJob::create(&self.output_directory)?;
+        if self.max_memory_mb == Some(0) {
+            return Err(EvalError::InvalidMemory);
+        }
+        let planned_attempts = self
+            .finite_run
+            .as_ref()
+            .map(|run| run.manifest.attempt_count());
+        let job = match &self.finite_run {
+            Some(run) => {
+                let job = match run.mode {
+                    FiniteRunMode::Fresh => EvalJob::create(&self.output_directory)?,
+                    FiniteRunMode::Resume => {
+                        EvalJob::resume_or_create(&self.output_directory, &run.manifest)?
+                    }
+                };
+                job.bind_run(&run.manifest)?;
+                job
+            }
+            None => EvalJob::create(&self.output_directory)?,
+        };
         let (event_sender, _) = broadcast::channel(EVENT_CAPACITY);
         Ok((
             Nanoeval {
                 inner: Arc::new(NanoevalInner {
                     nanocodex: self.nanocodex,
                     job,
-                    concurrency: Arc::new(Semaphore::new(self.max_concurrency)),
+                    planned_attempts,
+                    admission: Arc::new(AdmissionController::new(
+                        self.max_concurrency,
+                        self.max_memory_mb,
+                    )),
                     max_concurrency: self.max_concurrency,
+                    max_memory_mb: self.max_memory_mb,
                     next_prompt_cache_attempt: AtomicU64::new(0),
                     events: event_sender.clone(),
                     attempt_agent: self.attempt_agent,
@@ -712,6 +854,59 @@ impl NanoevalBuilder {
             },
             NanoevalEvents::new(event_sender),
         ))
+    }
+}
+
+impl AdmissionController {
+    fn new(max_concurrency: usize, max_memory_mb: Option<u64>) -> Self {
+        Self {
+            max_concurrency,
+            max_memory_mb,
+            state: Mutex::new(AdmissionState::default()),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>, requested_memory_mb: u64) -> AdmissionPermit {
+        let memory_mb = self
+            .max_memory_mb
+            .map_or(0, |limit| requested_memory_mb.min(limit));
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                let concurrency_available = state.running < self.max_concurrency;
+                let memory_available = self.max_memory_mb.is_none_or(|limit| {
+                    state
+                        .memory_mb
+                        .checked_add(memory_mb)
+                        .is_some_and(|total| total <= limit)
+                });
+                if concurrency_available && memory_available {
+                    state.running += 1;
+                    state.memory_mb += memory_mb;
+                    return AdmissionPermit {
+                        controller: Arc::clone(self),
+                        memory_mb,
+                    };
+                }
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .controller
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.running = state.running.saturating_sub(1);
+        state.memory_mb = state.memory_mb.saturating_sub(self.memory_mb);
+        drop(state);
+        self.controller.changed.notify_waiters();
     }
 }
 
@@ -856,10 +1051,11 @@ fn failure_kind(error: &EvalError) -> EvalFailureKind {
         | EvalError::UnsupportedEnvironmentEntry(_)
         | EvalError::AttemptAgent(_) => EvalFailureKind::Environment,
         EvalError::InvalidConcurrency
+        | EvalError::InvalidMemory
         | EvalError::Io(_)
         | EvalError::Json(_)
         | EvalError::RunConflict(_)
-        | EvalError::ConcurrencyClosed(_)
+        | EvalError::RunActive(_)
         | EvalError::MissingSweepCoordinate => EvalFailureKind::Internal,
     }
 }
@@ -1030,6 +1226,16 @@ const fn eval_status(status: EvalStatus) -> &'static str {
     }
 }
 
+fn validate_attempt_environment(task: &Task, custom_backend: bool) -> Result<(), EvalError> {
+    if task.requires_compose() && !custom_backend {
+        return Err(EvalError::UnsupportedNativeTask {
+            task: task.name().to_owned(),
+            reason: "custom Docker Compose environments are not available in native mode",
+        });
+    }
+    Ok(())
+}
+
 fn verifier_status(verifier: &crate::VerifierResult) -> EvalStatus {
     if verifier.rewards.values().all(|reward| *reward > 0.0) {
         EvalStatus::Passed
@@ -1141,6 +1347,7 @@ mod tracing_tests {
         collections::HashMap,
         fs,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use nanocodex::{Nanocodex, NanocodexError, ResponsesError};
@@ -1150,8 +1357,10 @@ mod tracing_tests {
         Layer, layer::Context as LayerContext, prelude::*, registry::LookupSpan,
     };
 
-    use super::{EvalError, Nanoeval, failure_kind};
-    use crate::{EvalFailureKind, Task};
+    use super::{
+        AdmissionController, EvalError, Nanoeval, failure_kind, validate_attempt_environment,
+    };
+    use crate::{EvalFailureKind, Sweep, Task};
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
@@ -1163,6 +1372,68 @@ mod tracing_tests {
     }
 
     struct FieldCapture<'a>(&'a mut HashMap<String, String>);
+
+    #[test]
+    fn fresh_finite_run_is_bound_before_execution() {
+        let output = tempdir().unwrap();
+        let task = Task::load(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting"),
+        )
+        .unwrap();
+        let sweep = Sweep::builder()
+            .task(task)
+            .trials(2)
+            .agent("default", Nanocodex::builder("test-key"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let (eval, _) = Nanoeval::builder(Nanocodex::builder("test-key"))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+
+        assert!(!eval.resumed());
+        assert_eq!(eval.planned_attempts(), Some(2));
+        assert_eq!(eval.remaining_attempts(&sweep).unwrap(), 2);
+        assert!(eval.directory().join("run.json").is_file());
+    }
+
+    #[test]
+    fn admission_is_work_conserving_within_memory_and_concurrency_limits() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(AdmissionController::new(2, Some(4)));
+            let three = admission.acquire(3).await;
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), admission.acquire(2))
+                    .await
+                    .is_err()
+            );
+            let one = tokio::time::timeout(Duration::from_millis(5), admission.acquire(1))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), admission.acquire(1))
+                    .await
+                    .is_err()
+            );
+
+            drop(one);
+            drop(three);
+            let oversized = admission.acquire(10).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), admission.acquire(1))
+                    .await
+                    .is_err()
+            );
+            drop(oversized);
+        });
+    }
 
     impl Visit for FieldCapture<'_> {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -1247,6 +1518,11 @@ allow_internet = false
         .unwrap();
         fs::write(task_root.path().join("tests/test.sh"), "exit 0\n").unwrap();
         let task = Task::load(task_root.path()).unwrap();
+        assert!(matches!(
+            validate_attempt_environment(&task, false),
+            Err(EvalError::UnsupportedNativeTask { .. })
+        ));
+        assert!(validate_attempt_environment(&task, true).is_ok());
         let output = tempdir().unwrap();
         let capture = TraceCapture::default();
         let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));

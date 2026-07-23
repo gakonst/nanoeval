@@ -14,7 +14,7 @@ use nanoeval::{
     AgentMetadata, AtifBuilder, AtifTrajectory, EvalEventKind, EvalEventStreamError, EvalFailure,
     EvalResult, Nanoeval, NanoevalEventStream, PhaseTiming, Task,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
 use url::Url;
 use uuid::Uuid;
@@ -304,22 +304,42 @@ struct HarborArtifacts {
     root: PathBuf,
     jobs_dir: PathBuf,
     max_concurrency: usize,
+    planned_attempts: Option<usize>,
+    baseline: Option<HarborJobResult>,
     recorded_trials: Mutex<Vec<HarborRecordedTrial>>,
 }
 
 impl HarborArtifacts {
     fn attach(eval: &Nanoeval) -> Result<Self, HarborError> {
+        let root = eval.directory().to_path_buf();
+        let baseline = Self::read_json_if_exists(&root.join("result.json"))?;
+        let recorded_trials = Self::read_json_if_exists::<HarborJobLock>(&root.join("lock.json"))?
+            .map_or_else(Vec::new, |lock| {
+                lock.trials
+                    .into_iter()
+                    .map(|lock| HarborRecordedTrial {
+                        task: HarborTaskConfig {
+                            path: lock.task.path.clone(),
+                            source: lock.task.source.clone(),
+                        },
+                        agent: lock.agent.clone(),
+                        lock,
+                    })
+                    .collect()
+            });
         let artifacts = Self {
             job_id: eval.id(),
             started_at: eval.started_at(),
-            root: eval.directory().to_path_buf(),
+            root,
             jobs_dir: eval.parent_directory().to_path_buf(),
             max_concurrency: eval.max_concurrency(),
-            recorded_trials: Mutex::new(Vec::new()),
+            planned_attempts: eval.planned_attempts(),
+            baseline,
+            recorded_trials: Mutex::new(recorded_trials),
         };
         Self::write_file(&artifacts.root.join("job.log"), [])?;
         artifacts.write_job_metadata()?;
-        artifacts.write_job(&[], &[], 0)?;
+        artifacts.write_job(&[], &[], artifacts.planned_attempts.unwrap_or(0))?;
         Ok(artifacts)
     }
 
@@ -360,7 +380,7 @@ impl HarborArtifacts {
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
                 path: task_path.clone(),
-                source: Some("nanoeval/local"),
+                source: Some("nanoeval/local".to_owned()),
             },
             trial_name: &result.trial_name,
             trials_dir: &self.root,
@@ -437,7 +457,7 @@ impl HarborArtifacts {
             recorded.push(HarborRecordedTrial {
                 task: HarborTaskConfig {
                     path: task.root().to_path_buf(),
-                    source: Some("nanoeval/local"),
+                    source: Some("nanoeval/local".to_owned()),
                 },
                 agent: harbor_agent_config(&result.agent.model, &result.agent.effort),
                 lock,
@@ -466,7 +486,7 @@ impl HarborArtifacts {
         let config = HarborTrialConfig {
             task: HarborTaskConfig {
                 path: task_path.clone(),
-                source: Some("nanoeval/local"),
+                source: Some("nanoeval/local".to_owned()),
             },
             trial_name: &failure.trial_name,
             trials_dir: &self.root,
@@ -534,7 +554,7 @@ impl HarborArtifacts {
             recorded.push(HarborRecordedTrial {
                 task: HarborTaskConfig {
                     path: task.root().to_path_buf(),
-                    source: Some("nanoeval/local"),
+                    source: Some("nanoeval/local".to_owned()),
                 },
                 agent: harbor_agent_config(model, effort),
                 lock,
@@ -550,76 +570,31 @@ impl HarborArtifacts {
         n_total_trials: usize,
     ) -> Result<(), HarborError> {
         let now = Utc::now();
-        let input_tokens = results
-            .iter()
-            .map(|result| result.agent.usage.input_tokens)
-            .sum();
-        let cached_tokens = results
-            .iter()
-            .map(|result| result.agent.usage.cached_input_tokens)
-            .sum();
-        let output_tokens = results
-            .iter()
-            .map(|result| result.agent.usage.output_tokens)
-            .sum();
-        let reported_costs: Vec<f64> = results
-            .iter()
-            .filter_map(|result| result.agent.cost_usd)
-            .collect();
-        let mut reward_stats = BTreeMap::<String, BTreeMap<String, Vec<String>>>::new();
-        for result in results {
-            for (name, reward) in &result.verifier.rewards {
-                reward_stats
-                    .entry(name.clone())
-                    .or_default()
-                    .entry(harbor_float_key(*reward))
-                    .or_default()
-                    .push(result.trial_name.clone());
-            }
-        }
-        let eval_key = results.first().map_or_else(
-            || {
-                failures.first().map_or_else(
-                    || "nanocodex__nanoeval/local".to_owned(),
-                    |failure| format!("nanocodex__{}__nanoeval/local", failure.model),
-                )
-            },
-            |result| format!("nanocodex__{}__nanoeval/local", result.agent.model),
-        );
-        let mut exception_stats = BTreeMap::<String, Vec<String>>::new();
-        for failure in failures {
-            exception_stats
-                .entry(failure.kind.harbor_exception_type().to_owned())
-                .or_default()
-                .push(failure.trial_name.clone());
-        }
-        let eval_stats = HarborAgentDatasetStats {
-            n_trials: results.len(),
-            n_errors: failures.len(),
-            metrics: Vec::new(),
-            pass_at_k: BTreeMap::new(),
-            reward_stats,
-            exception_stats,
-        };
+        let mut stats = self
+            .baseline
+            .as_ref()
+            .map_or_else(HarborJobStats::default, |baseline| baseline.stats.clone());
+        HarborJobDelta::new(results, failures).apply(&mut stats);
+        let baseline_total = self
+            .baseline
+            .as_ref()
+            .map_or(0, |baseline| baseline.n_total_trials);
+        let n_total_trials = n_total_trials
+            .max(self.planned_attempts.unwrap_or(0))
+            .max(baseline_total)
+            .max(stats.n_completed_trials);
+        stats.n_pending_trials = n_total_trials.saturating_sub(stats.n_completed_trials);
         let job = HarborJobResult {
             id: self.job_id,
-            started_at: self.started_at,
+            started_at: self
+                .baseline
+                .as_ref()
+                .map_or(self.started_at, |baseline| baseline.started_at),
             updated_at: now,
-            finished_at: (!(results.is_empty() && failures.is_empty())).then_some(now),
+            finished_at: (n_total_trials > 0 && stats.n_completed_trials == n_total_trials)
+                .then_some(now),
             n_total_trials,
-            stats: HarborJobStats {
-                n_completed_trials: results.len() + failures.len(),
-                n_errored_trials: failures.len(),
-                n_running_trials: 0,
-                n_pending_trials: n_total_trials.saturating_sub(results.len() + failures.len()),
-                n_cancelled_trials: 0,
-                n_retries: 0,
-                evals: BTreeMap::from([(eval_key, eval_stats)]),
-                n_input_tokens: input_tokens,
-                n_cache_tokens: cached_tokens,
-                n_output_tokens: output_tokens,
-                cost_usd: (!reported_costs.is_empty()).then(|| reported_costs.into_iter().sum()),
-            },
+            stats,
         };
         Self::write_json(&self.root.join("result.json"), &job)
     }
@@ -676,6 +651,17 @@ impl HarborArtifacts {
         Self::atomic_write(path, bytes)
     }
 
+    fn read_json_if_exists<T>(path: &Path) -> Result<Option<T>, HarborError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), HarborError> {
         let mut name: OsString = path
             .file_name()
@@ -698,7 +684,7 @@ impl HarborArtifacts {
 
 fn harbor_agent_config(model: &str, effort: &str) -> HarborAgentConfig {
     HarborAgentConfig {
-        name: "nanocodex",
+        name: "nanocodex".to_owned(),
         model_name: format!("openai/{model}"),
         kwargs: HarborAgentKwargs {
             effort: effort.to_owned(),
@@ -746,7 +732,7 @@ struct HarborJobConfig {
     tasks: Vec<HarborTaskConfig>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct HarborJobLock {
     schema_version: u32,
     created_at: DateTime<Utc>,
@@ -756,13 +742,13 @@ struct HarborJobLock {
     trials: Vec<HarborTrialLock>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct HarborLockInfo {}
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct HarborRetryConfig {
     max_retries: u32,
-    exclude_exceptions: Vec<&'static str>,
+    exclude_exceptions: Vec<String>,
     wait_multiplier: f64,
     min_wait_sec: f64,
     max_wait_sec: f64,
@@ -772,7 +758,7 @@ impl Default for HarborRetryConfig {
     fn default() -> Self {
         Self {
             max_retries: 0,
-            exclude_exceptions: vec![
+            exclude_exceptions: [
                 "AgentTimeoutError",
                 "VerifierTimeoutError",
                 "RewardFileNotFoundError",
@@ -782,7 +768,10 @@ impl Default for HarborRetryConfig {
                 "AgentSafetyRefusalError",
                 "AgentAuthenticationError",
                 "ModelNotFoundError",
-            ],
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             wait_multiplier: 1.0,
             min_wait_sec: 1.0,
             max_wait_sec: 60.0,
@@ -790,7 +779,7 @@ impl Default for HarborRetryConfig {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborTrialLock {
     schema_version: u32,
     task: HarborTaskLock,
@@ -815,13 +804,13 @@ impl HarborTrialLock {
                     .to_owned(),
                 kind: HarborTaskLockKind::Local,
                 digest: format!("sha256:{digest}"),
-                source: Some("nanoeval/local"),
+                source: Some("nanoeval/local".to_owned()),
                 path: task.root().to_path_buf(),
             },
             install_only: false,
             timeout_multiplier: 1.0,
             agent: HarborAgentConfig {
-                name: "nanocodex",
+                name: "nanocodex".to_owned(),
                 model_name: format!("openai/{model}"),
                 kwargs: HarborAgentKwargs {
                     effort: effort.to_owned(),
@@ -834,23 +823,23 @@ impl HarborTrialLock {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborTaskLock {
     name: String,
     #[serde(rename = "type")]
     kind: HarborTaskLockKind,
     digest: String,
-    source: Option<&'static str>,
+    source: Option<String>,
     path: PathBuf,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum HarborTaskLockKind {
     Local,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborAgentSkillLock {}
 
 #[derive(Serialize)]
@@ -866,30 +855,30 @@ struct HarborTrialConfig<'a> {
     job_id: Uuid,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborTaskConfig {
     path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<&'static str>,
+    source: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborAgentConfig {
-    name: &'static str,
+    name: String,
     model_name: String,
     kwargs: HarborAgentKwargs,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborAgentKwargs {
     effort: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborEnvironmentConfig {
     #[serde(rename = "type")]
     environment_type: Option<HarborEnvironmentType>,
-    import_path: &'static str,
+    import_path: String,
     delete: bool,
     cpu_enforcement_policy: ResourceMode,
     memory_enforcement_policy: ResourceMode,
@@ -897,42 +886,44 @@ struct HarborEnvironmentConfig {
 }
 
 impl HarborEnvironmentConfig {
-    const fn native() -> Self {
+    fn native() -> Self {
         Self {
             environment_type: None,
-            import_path: "nanoeval.native:NativeEnvironment",
+            import_path: "nanoeval.native:NativeEnvironment".to_owned(),
             delete: false,
             cpu_enforcement_policy: ResourceMode::Ignore,
             memory_enforcement_policy: ResourceMode::Ignore,
-            kwargs: NativeEnvironmentKwargs { backend: "native" },
+            kwargs: NativeEnvironmentKwargs {
+                backend: "native".to_owned(),
+            },
         }
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum HarborEnvironmentType {}
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ResourceMode {
     Ignore,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct NativeEnvironmentKwargs {
-    backend: &'static str,
+    backend: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborVerifierConfig {
-    import_path: &'static str,
+    import_path: String,
 }
 
 impl HarborVerifierConfig {
-    const fn native() -> Self {
+    fn native() -> Self {
         Self {
-            import_path: "nanoeval.native:Verifier",
+            import_path: "nanoeval.native:Verifier".to_owned(),
         }
     }
 }
@@ -1010,7 +1001,7 @@ struct HarborVerifierResult<'a> {
 #[derive(Serialize)]
 struct HarborArtifactManifestEntry {}
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborJobResult {
     id: Uuid,
     started_at: DateTime<Utc>,
@@ -1020,7 +1011,91 @@ struct HarborJobResult {
     stats: HarborJobStats,
 }
 
-#[derive(Serialize)]
+struct HarborJobDelta {
+    eval_key: Option<String>,
+    eval_stats: HarborAgentDatasetStats,
+    input_tokens: u64,
+    cached_tokens: u64,
+    output_tokens: u64,
+    cost_usd: Option<f64>,
+}
+
+impl HarborJobDelta {
+    fn new(results: &[EvalResult], failures: &[EvalFailure]) -> Self {
+        let mut reward_stats = BTreeMap::<String, BTreeMap<String, Vec<String>>>::new();
+        for result in results {
+            for (name, reward) in &result.verifier.rewards {
+                reward_stats
+                    .entry(name.clone())
+                    .or_default()
+                    .entry(harbor_float_key(*reward))
+                    .or_default()
+                    .push(result.trial_name.clone());
+            }
+        }
+        let mut exception_stats = BTreeMap::<String, Vec<String>>::new();
+        for failure in failures {
+            exception_stats
+                .entry(failure.kind.harbor_exception_type().to_owned())
+                .or_default()
+                .push(failure.trial_name.clone());
+        }
+        let eval_key = results
+            .first()
+            .map(|result| result.agent.model.as_str())
+            .or_else(|| failures.first().map(|failure| failure.model.as_str()))
+            .map(|model| format!("nanocodex__{model}__nanoeval/local"));
+        Self {
+            eval_key,
+            eval_stats: HarborAgentDatasetStats {
+                n_trials: results.len(),
+                n_errors: failures.len(),
+                reward_stats,
+                exception_stats,
+                ..HarborAgentDatasetStats::default()
+            },
+            input_tokens: results
+                .iter()
+                .map(|result| result.agent.usage.input_tokens)
+                .sum(),
+            cached_tokens: results
+                .iter()
+                .map(|result| result.agent.usage.cached_input_tokens)
+                .sum(),
+            output_tokens: results
+                .iter()
+                .map(|result| result.agent.usage.output_tokens)
+                .sum(),
+            cost_usd: results
+                .iter()
+                .filter_map(|result| result.agent.cost_usd)
+                .reduce(|total, cost| total + cost),
+        }
+    }
+
+    fn apply(self, stats: &mut HarborJobStats) {
+        let completed = self.eval_stats.n_trials + self.eval_stats.n_errors;
+        let errors = self.eval_stats.n_errors;
+        if let Some(eval_key) = self.eval_key {
+            self.eval_stats
+                .merge_into(stats.evals.entry(eval_key).or_default());
+        } else if stats.evals.is_empty() {
+            stats
+                .evals
+                .insert("nanocodex__nanoeval/local".to_owned(), self.eval_stats);
+        }
+        stats.n_completed_trials += completed;
+        stats.n_errored_trials += errors;
+        stats.n_input_tokens += self.input_tokens;
+        stats.n_cache_tokens += self.cached_tokens;
+        stats.n_output_tokens += self.output_tokens;
+        if let Some(cost) = self.cost_usd {
+            stats.cost_usd = Some(stats.cost_usd.unwrap_or_default() + cost);
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct HarborJobStats {
     n_completed_trials: usize,
     n_errored_trials: usize,
@@ -1035,7 +1110,7 @@ struct HarborJobStats {
     cost_usd: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct HarborAgentDatasetStats {
     n_trials: usize,
     n_errors: usize,
@@ -1045,7 +1120,27 @@ struct HarborAgentDatasetStats {
     exception_stats: BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Serialize)]
+impl HarborAgentDatasetStats {
+    fn merge_into(self, retained: &mut Self) {
+        retained.n_trials += self.n_trials;
+        retained.n_errors += self.n_errors;
+        for (metric, rewards) in self.reward_stats {
+            let retained_rewards = retained.reward_stats.entry(metric).or_default();
+            for (reward, trials) in rewards {
+                retained_rewards.entry(reward).or_default().extend(trials);
+            }
+        }
+        for (exception, trials) in self.exception_stats {
+            retained
+                .exception_stats
+                .entry(exception)
+                .or_default()
+                .extend(trials);
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 struct HarborMetric {}
 
 #[cfg(test)]
@@ -1053,7 +1148,7 @@ mod tests {
     use std::fs;
 
     use nanocodex::{Nanocodex, OpenAiAuth};
-    use nanoeval::{AtifTrajectory, Nanoeval, Task};
+    use nanoeval::{AtifTrajectory, Nanoeval, Sweep, Task};
     use serde::Deserialize;
     use tempfile::tempdir;
 
@@ -1084,6 +1179,35 @@ mod tests {
         errored: usize,
         #[serde(rename = "n_pending_trials")]
         pending: usize,
+    }
+
+    #[test]
+    fn finite_job_records_pending_trials_before_execution() {
+        let output = tempdir().unwrap();
+        let task = Task::load(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks/write-greeting"),
+        )
+        .unwrap();
+        let sweep = Sweep::builder()
+            .task(task)
+            .trials(2)
+            .agent("default", Nanocodex::builder("test-key"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let (eval, _) = Nanoeval::builder(Nanocodex::builder("test-key"))
+            .output_directory(output.path())
+            .fresh_run(&sweep)
+            .build()
+            .unwrap();
+
+        Harbor::new(&eval).unwrap();
+        let result: JobResult =
+            serde_json::from_slice(&fs::read(eval.directory().join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(result.n_total_trials, 2);
+        assert_eq!(result.stats.completed, 0);
+        assert_eq!(result.stats.pending, 2);
     }
 
     #[tokio::test]

@@ -32,13 +32,6 @@ pub(crate) struct VerifierExecution {
 
 impl NativeAttempt {
     pub fn prepare(output: &Path, trial_name: &str, task: &Task) -> Result<Self, EvalError> {
-        if task.requires_compose() {
-            return Err(EvalError::UnsupportedNativeTask {
-                task: task.name().to_owned(),
-                reason: "custom Docker Compose environments are not available in native mode",
-            });
-        }
-
         let started_at = Utc::now();
         let root = output.join(trial_name);
         let workspace = root.join("workspace");

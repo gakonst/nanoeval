@@ -4,6 +4,7 @@
 /.nanoeval-comparison/
 /.nanoeval-view/
 /.nanoeval-vm-*/
+/.nanoeval/
 /nanoeval-runs/
 /nanoeval-native-runs/
 /nanoeval-*-runs*/

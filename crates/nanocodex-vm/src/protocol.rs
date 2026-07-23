@@ -89,6 +89,7 @@ pub(crate) struct ExecuteResponse {
     pub stdout: Option<Vec<u8>>,
     pub stderr: Option<Vec<u8>>,
     pub error: Option<String>,
+    pub timed_out: bool,
 }
 
 #[derive(Deserialize, Serialize)]

@@ -65,6 +65,7 @@ pub struct EvalResult {
 #[derive(Clone, Debug, Serialize)]
 pub struct SweepResults {
     attempts: Vec<SweepAttemptResult>,
+    skipped: usize,
 }
 
 /// One self-identifying result in a [`SweepResults`] collection.
@@ -76,13 +77,19 @@ pub struct SweepAttemptResult {
 }
 
 impl SweepResults {
-    pub(crate) const fn new(attempts: Vec<SweepAttemptResult>) -> Self {
-        Self { attempts }
+    pub(crate) const fn new(attempts: Vec<SweepAttemptResult>, skipped: usize) -> Self {
+        Self { attempts, skipped }
     }
 
     #[must_use]
     pub fn attempts(&self) -> &[SweepAttemptResult] {
         &self.attempts
+    }
+
+    /// Returns the number of already-completed attempts skipped while resuming.
+    #[must_use]
+    pub const fn skipped(&self) -> usize {
+        self.skipped
     }
 
     #[must_use]

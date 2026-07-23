@@ -14,7 +14,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
 };
-use tracing::{Instrument, info, info_span};
+use tracing::{Instrument, Span, info, info_span};
 
 use crate::{
     VmToolClient,
@@ -104,6 +104,9 @@ pub enum VmToolSessionError {
 
     #[error("guest tool execution failed: {0}")]
     Guest(String),
+
+    #[error("guest command exceeded {0:?}")]
+    GuestTimeout(Duration),
 
     #[error("invalid VM tool response: {0}")]
     Protocol(&'static str),
@@ -277,21 +280,9 @@ impl VmToolSession {
         state.input.write_all(b"\n").await?;
         state.input.flush().await?;
 
-        let line = state
-            .output
-            .next_line()
-            .await?
-            .ok_or(VmToolSessionError::Closed)?;
-        span.record("rpc.response.bytes", line.len());
+        let (response, response_bytes) = read_response(&mut state, id, span).await?;
+        span.record("rpc.response.bytes", response_bytes);
         span.record("vm.session.age_ns", elapsed_ns(self.inner.spawned_at));
-        record_vm_content(span, "tool.response", &line);
-        let response = serde_json::from_str::<SessionResponse>(&line)?;
-        if response.id() != id {
-            return Err(VmToolSessionError::ResponseId {
-                expected: id,
-                actual: response.id(),
-            });
-        }
         let SessionResponse::Tool(response) = response else {
             return Err(VmToolSessionError::Protocol("expected a tool response"));
         };
@@ -373,7 +364,8 @@ impl VmToolSession {
     /// Returns an error when the console closes, the command cannot run or
     /// exceeds its deadline, or the typed response is invalid.
     pub async fn command(&self, command: VmCommand) -> Result<VmCommandOutput, VmToolSessionError> {
-        let timeout_millis = u64::try_from(command.timeout.as_millis()).unwrap_or(u64::MAX);
+        let command_timeout = command.timeout;
+        let timeout_millis = u64::try_from(command_timeout.as_millis()).unwrap_or(u64::MAX);
         let response = self
             .control_request(|id| {
                 SessionRequest::Execute(ExecuteRequest {
@@ -391,18 +383,22 @@ impl VmToolSession {
             stdout,
             stderr,
             error,
+            timed_out,
             ..
         }) = response
         else {
             return Err(VmToolSessionError::Protocol("expected an execute response"));
         };
-        match (exit_code, stdout, stderr, error) {
-            (Some(exit_code), Some(stdout), Some(stderr), None) => Ok(VmCommandOutput {
+        match (exit_code, stdout, stderr, error, timed_out) {
+            (Some(exit_code), Some(stdout), Some(stderr), None, false) => Ok(VmCommandOutput {
                 exit_code,
                 stdout,
                 stderr,
             }),
-            (None, None, None, Some(error)) => Err(VmToolSessionError::Guest(error)),
+            (None, None, None, None, true) => {
+                Err(VmToolSessionError::GuestTimeout(command_timeout))
+            }
+            (None, None, None, Some(error), false) => Err(VmToolSessionError::Guest(error)),
             _ => Err(VmToolSessionError::Protocol(
                 "invalid execute response fields",
             )),
@@ -448,19 +444,43 @@ impl VmToolSession {
         state.input.write_all(encoded.as_bytes()).await?;
         state.input.write_all(b"\n").await?;
         state.input.flush().await?;
+        let (response, _) = read_response(&mut state, id, &Span::current()).await?;
+        Ok(response)
+    }
+}
+
+async fn read_response(
+    state: &mut SessionState,
+    expected_id: u64,
+    span: &Span,
+) -> Result<(SessionResponse, usize), VmToolSessionError> {
+    let mut response_bytes = 0_usize;
+    loop {
         let line = state
             .output
             .next_line()
             .await?
             .ok_or(VmToolSessionError::Closed)?;
+        response_bytes = response_bytes.saturating_add(line.len());
+        record_vm_content(span, "tool.response", &line);
         let response = serde_json::from_str::<SessionResponse>(&line)?;
-        if response.id() != id {
-            return Err(VmToolSessionError::ResponseId {
-                expected: id,
-                actual: response.id(),
-            });
+        let actual_id = response.id();
+        if actual_id == expected_id {
+            return Ok((response, response_bytes));
         }
-        Ok(response)
+        if actual_id < expected_id {
+            info!(
+                target: "nanocodex_vm",
+                rpc_request_id = expected_id,
+                rpc_response_id = actual_id,
+                "discarded response for a cancelled VM tool request"
+            );
+            continue;
+        }
+        return Err(VmToolSessionError::ResponseId {
+            expected: expected_id,
+            actual: actual_id,
+        });
     }
 }
 
@@ -660,6 +680,7 @@ async fn execute_guest_command(request: ExecuteRequest) -> ExecuteResponse {
             stdout: Some(output.stdout),
             stderr: Some(output.stderr),
             error: None,
+            timed_out: false,
         },
         Ok(Err(error)) => ExecuteResponse {
             id: request.id,
@@ -667,13 +688,15 @@ async fn execute_guest_command(request: ExecuteRequest) -> ExecuteResponse {
             stdout: None,
             stderr: None,
             error: Some(error.to_string()),
+            timed_out: false,
         },
         Err(_) => ExecuteResponse {
             id: request.id,
             exit_code: None,
             stdout: None,
             stderr: None,
-            error: Some(format!("guest command exceeded {timeout:?}")),
+            error: None,
+            timed_out: true,
         },
     }
 }
@@ -683,6 +706,7 @@ mod tracing_tests {
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use nanocodex_tools::{StandardTool, ToolContext, ToolInput};
@@ -810,5 +834,35 @@ mod tracing_tests {
         assert!(rpc.fields.contains_key("rpc.queue.duration_ns"));
         assert!(rpc.fields.contains_key("duration_ns"));
         assert!(spans.values().any(|span| span.name == "vm.session.spawn"));
+    }
+
+    #[test]
+    fn next_request_discards_a_cancelled_requests_late_response() {
+        let first = r#"{"kind":"write_file","payload":{"id":0,"error":null}}"#;
+        let second = r#"{"kind":"write_file","payload":{"id":1,"error":null}}"#;
+        let script = format!(
+            "IFS= read -r first\nsleep 0.05\nprintf '%s\\n' '{first}'\nIFS= read -r second\nprintf '%s\\n' '{second}'"
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let session = VmToolSession::spawn(&mut command).unwrap();
+            let cancelled = tokio::time::timeout(
+                Duration::from_millis(10),
+                session.write_file("/first", Vec::new(), 0o600),
+            )
+            .await;
+            assert!(cancelled.is_err());
+
+            session
+                .write_file("/second", Vec::new(), 0o600)
+                .await
+                .unwrap();
+        });
     }
 }

@@ -16,6 +16,7 @@ description = "Fast, library-first evaluation for Nanocodex agents"
 [dependencies]
 chrono.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 nanocodex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

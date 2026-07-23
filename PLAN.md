@@ -77,6 +77,39 @@ in its fresh verifier guest, and 4.17 ms finalizing Harbor output. A fully warm
 three-task preparation took 23 ms in process and 0.03 seconds through the built
 binary. Cargo/link/sign remains an explicitly separate developer-loop metric.
 
+The first complete Terminal-Bench 2.1 warm VM run is now complete. All 89
+canonical tasks ran at concurrency six in one durable job in 3,523.21 seconds
+(58m43s), down from 3,988 seconds (66m28s) for the earlier alphabetical run.
+The result contained 62 passes, 22 ordinary verifier-scored failures, four
+typed API safety refusals, and one agent timeout. There were no environment,
+verifier, VM-session, or Nanoeval errors. `pypi-server`, `git-multibranch`,
+`install-windows-3.11`, and `nginx-request-logging` all passed with their
+agent-started services retained in the same isolated guest through verification.
+Harbor 0.20.0 accepted the job and every one of its 89 configs, results, and
+ATIF-v1.7 trajectories; `harbor view` served the aggregate, trial, and trajectory
+APIs directly. The run reused 29,675,008 of 32,741,686 input tokens (90.63%).
+Outside-attempt runtime/environment/evaluator/Harbor setup was about 2.2 seconds;
+the remaining wall time is agent, guest-tool, and canonical-verifier work.
+That full run used Nanocodex `508c0254`. Nanoeval now pins current master
+`f1b4f8bc`; a post-update `regex-log` VM smoke passed in 42.61 seconds with
+reward `1`, five Harbor-valid ATIF steps, and the same cached verifier path.
+
+The definitive current-master concurrency-eight run is complete with a 24 GiB
+task-declared memory ceiling. It produced trustworthy terminal artifacts for
+all 89 tasks in 3,310.32 seconds (55m10s), 6.04% faster than the prior
+concurrency-six milestone: 68 passes, 17 scored failures, four typed safety
+refusals, and zero errors. The other 88 attempts completed in exactly 2,520
+seconds (42m00s); the final generated tensor-parallel implementation reached
+the task-owned 900-second verifier deadline. The typed protocol retained that
+as exit-124 evidence and reward `0` with no exception, while I/O, protocol,
+spawn, and VMM failures remain errors. The admission controller held the
+declared live set at or below 24 GiB and allowed smaller fitting work to bypass
+a memory-blocked large waiter. The run reused 90.78% of input tokens and had no
+environment, VM-session, verifier-infrastructure, or Nanoeval failure. Harbor
+0.20 accepted the job plus all 89 configs, results, and ATIF trajectories;
+`harbor view` served the full aggregate, deadline-scored trial, and trajectory.
+All four service-persistence/loopback regressions passed in the same run.
+
 ## Library boundaries
 
 The repository follows the same library-first layout as Nanocodex:
@@ -479,7 +512,8 @@ measured complexity, fault containment, and performance.
   all 89 tasks: multi-stage `FROM`, `RUN`, `COPY`/`COPY --from`, `WORKDIR`,
   `ENV`, `ARG`, and `CMD`; prove ordinary RUN/COPY, shell-only Alpine, ENV
   propagation, and the suite's unique multi-stage COPY edge.
-- [ ] Cold-build all 89 tasks and classify runtime/kernel incompatibilities.
+- [x] Cold-build all 89 tasks and execute the complete suite through the VM
+  backend without a Docker-compatible runtime.
 
 Gate: no Docker-compatible runtime is invoked, and repeated preparation of an
 unchanged task is a cache hit.
@@ -512,8 +546,11 @@ semantics before any full benchmark run.
 
 ### 6. Durable bounded scheduler
 
-- Add stable job and attempt IDs, immutable artifacts, resume, retry lineage,
-  duration-aware ordering, and serialized reporting outside execution permits.
+- [x] Add stable job and attempt IDs, immutable terminal artifacts, automatic
+  resume, duration-aware ordering, and serialized Harbor reporting.
+- [x] Prove Ctrl+C recovery on a real ten-attempt VM job: two durable attempts
+  were skipped and the remaining eight completed in the same job without a
+  duplicate terminal result.
 - Fault-inject termination at every durable transition.
 
 Gate: randomized restart tests retain byte-identical completed artifacts, at
@@ -522,11 +559,12 @@ no leaked VM or guest process.
 
 ### 7. Focused and full comparisons
 
-- Run a cheap representative subset first.
-- Compare warm and cold paths separately at increasing concurrency.
-- Inspect exact event logs, guest command streams, verifier output, and result
+- [x] Run cheap representative subsets first.
+- [x] Compare warm and cold preparation paths separately.
+- [x] Inspect exact event logs, guest command streams, verifier output, and result
   exports before claiming parity or speed.
-- Run the full configured evaluation only as a milestone gate.
+- [x] Run all 89 Terminal-Bench 2.1 tasks as a warm milestone gate.
+- [ ] Establish an exact same-revision Harbor wall-time and score baseline.
 
 Gate: measured throughput or tail-time improvement with no unexplained score or
 artifact divergence.
@@ -557,25 +595,21 @@ artifact divergence.
 
 ## Immediate next experiment
 
-Do not scale beyond the proven task yet:
+Use the retained 89-task run as the optimization corpus:
 
-1. [x] add an explicit guest shutdown/flush control operation and boot the
-   verifier as a fresh VMM child from the complete mutated disk;
-2. [x] add a content-addressed post-agent apt/uv cache, strict readiness checks,
-   runtime DNS injection, and a separate CoW verifier disk; `regex-log` passed
-   from `ubuntu:24.04` and improved from 18.187 seconds cold to 11.505 seconds
-   warm without exposing curl to the agent disk;
-3. [x] replace writable verifier virtiofs shares with a content-addressed CoW
-   ext4 dependency disk and start recognized warm scripts after their cached
-   bootstrap; `regex-log` verification fell from 7.695 seconds to 0.960 seconds
-   with the same reward and CTRF result;
+1. use the retained concurrency-eight, memory-aware full-run trace for the next
+   scheduling change rather than repeating the completed admission gate;
+2. separate agent and verifier admission only if the trace proves long
+   canonical verifiers are idling model-capable slots without overcommitting
+   guest memory;
+3. generalize the sealed post-agent verifier layer beyond the strictly
+   recognized pinned apt/uv bootstrap without exposing verifier dependencies to
+   the agent;
 4. make the official `libkrunfw` acquisition/build an explicit cached prepare
    dependency so a clean checkout does not rely on a manually populated dylib;
-5. independently compare the prepared ext4 metadata and image config with an
-   OCI reference extraction;
-6. make verifier timeout terminate its complete guest process group and export
-   a general workspace artifact archive instead of the proof task's answer file;
-7. rerun only `count-dataset-tokens` against a pinned Harbor baseline and
-   reconcile every result/trajectory/verifier field; and
-8. cold-build the 89-task inventory only after the single-task Harbor parity
-   gate, then select the next runtime/kernel compatibility slice.
+5. independently compare prepared ext4 metadata and image config with an OCI
+   reference extraction;
+6. fault-inject every durable scheduler transition and repeatedly stress the
+   tracing/cancellation tests; and
+7. run an exact same-revision Harbor baseline before making a Harbor speedup
+   claim.
