@@ -1915,8 +1915,8 @@ dependencies = [
 
 [[package]]
 name = "nanocodex"
-version = "0.1.0"
-source = "git+https://github.com/gakonst/nanocodex?rev=621300f0db6d485a62f0a81344f7ae879a1964e0#621300f0db6d485a62f0a81344f7ae879a1964e0"
+version = "0.1.1"
+source = "git+https://github.com/gakonst/nanocodex?rev=508c025469006c90bc984b66e8b5c56762cc9da7#508c025469006c90bc984b66e8b5c56762cc9da7"
 dependencies = [
  "async-trait",
  "base64",
@@ -1949,8 +1949,8 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-core"
-version = "0.1.0"
-source = "git+https://github.com/gakonst/nanocodex?rev=621300f0db6d485a62f0a81344f7ae879a1964e0#621300f0db6d485a62f0a81344f7ae879a1964e0"
+version = "0.1.1"
+source = "git+https://github.com/gakonst/nanocodex?rev=508c025469006c90bc984b66e8b5c56762cc9da7#508c025469006c90bc984b66e8b5c56762cc9da7"
 dependencies = [
  "serde",
  "serde_json",
@@ -1962,8 +1962,8 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-macros"
-version = "0.1.0"
-source = "git+https://github.com/gakonst/nanocodex?rev=621300f0db6d485a62f0a81344f7ae879a1964e0#621300f0db6d485a62f0a81344f7ae879a1964e0"
+version = "0.1.1"
+source = "git+https://github.com/gakonst/nanocodex?rev=508c025469006c90bc984b66e8b5c56762cc9da7#508c025469006c90bc984b66e8b5c56762cc9da7"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1973,8 +1973,8 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-mcp"
-version = "0.1.0"
-source = "git+https://github.com/gakonst/nanocodex?rev=621300f0db6d485a62f0a81344f7ae879a1964e0#621300f0db6d485a62f0a81344f7ae879a1964e0"
+version = "0.1.1"
+source = "git+https://github.com/gakonst/nanocodex?rev=508c025469006c90bc984b66e8b5c56762cc9da7#508c025469006c90bc984b66e8b5c56762cc9da7"
 dependencies = [
  "async-trait",
  "bm25",
@@ -1992,8 +1992,8 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-observability"
-version = "0.1.0"
-source = "git+https://github.com/gakonst/nanocodex?rev=621300f0db6d485a62f0a81344f7ae879a1964e0#621300f0db6d485a62f0a81344f7ae879a1964e0"
+version = "0.1.1"
+source = "git+https://github.com/gakonst/nanocodex?rev=508c025469006c90bc984b66e8b5c56762cc9da7#508c025469006c90bc984b66e8b5c56762cc9da7"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -2010,8 +2010,8 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-service"
-version = "0.1.0"
-source = "git+https://github.com/gakonst/nanocodex?rev=621300f0db6d485a62f0a81344f7ae879a1964e0#621300f0db6d485a62f0a81344f7ae879a1964e0"
+version = "0.1.1"
+source = "git+https://github.com/gakonst/nanocodex?rev=508c025469006c90bc984b66e8b5c56762cc9da7#508c025469006c90bc984b66e8b5c56762cc9da7"
 dependencies = [
  "base64",
  "futures-util",
@@ -2034,8 +2034,8 @@ dependencies = [
 
 [[package]]
 name = "nanocodex-tools"
-version = "0.1.0"
-source = "git+https://github.com/gakonst/nanocodex?rev=621300f0db6d485a62f0a81344f7ae879a1964e0#621300f0db6d485a62f0a81344f7ae879a1964e0"
+version = "0.1.1"
+source = "git+https://github.com/gakonst/nanocodex?rev=508c025469006c90bc984b66e8b5c56762cc9da7#508c025469006c90bc984b66e8b5c56762cc9da7"
 dependencies = [
  "async-trait",
  "base64",

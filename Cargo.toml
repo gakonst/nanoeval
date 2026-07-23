@@ -26,9 +26,9 @@ futures-util = "0.3.31"
 flate2 = "1.1"
 ignore = "0.4.31"
 krun = { package = "libkrun", git = "https://github.com/containers/libkrun", branch = "main", features = ["blk"] }
-nanocodex = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "621300f0db6d485a62f0a81344f7ae879a1964e0" }
-nanocodex-observability = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "621300f0db6d485a62f0a81344f7ae879a1964e0" }
-nanocodex-tools = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "621300f0db6d485a62f0a81344f7ae879a1964e0", default-features = false }
+nanocodex = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "508c025469006c90bc984b66e8b5c56762cc9da7" }
+nanocodex-observability = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "508c025469006c90bc984b66e8b5c56762cc9da7" }
+nanocodex-tools = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "508c025469006c90bc984b66e8b5c56762cc9da7", default-features = false }
 nanocodex-vm = { version = "0.1.0", path = "crates/nanocodex-vm" }
 nanoeval = { version = "0.1.0", path = "crates/nanoeval" }
 nanoeval-harbor = { version = "0.1.0", path = "crates/nanoeval-harbor" }
