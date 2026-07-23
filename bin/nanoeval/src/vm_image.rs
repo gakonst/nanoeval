@@ -23,7 +23,8 @@ use tracing::info;
 const BLOCK_SIZE: u32 = 4_096;
 const MINIMUM_DISK_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_RECORD_VERSION: u32 = 2;
-const TASK_BUILD_CACHE_VERSION: u32 = 1;
+const TASK_BUILD_CACHE_VERSION: u32 = 3;
+const PREPARED_DISK_RECORD_VERSION: u32 = 1;
 const CONTEXT_DISK_BYTES: u64 = 128 * 1024 * 1024;
 const BUILD_STEP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BUILD_COPY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -34,6 +35,22 @@ const BUILD_CONTEXT_DEVICE: &str = "/dev/vdc";
 const BUILD_RUNTIME_MOUNT: &str = "/run/nanoeval";
 const BUILD_CONTEXT_MOUNT: &str = "/mnt/nanoeval-context";
 const DEFAULT_GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const COPY_SCRIPT: &str = r#"set -eu
+dest=$1
+shift
+if [ "$#" -gt 1 ]; then
+  mkdir -p "$dest"
+  for src do cp -a "$src" "$dest/"; done
+elif [ -d "$1" ]; then
+  mkdir -p "$dest"
+  cp -a "$1/." "$dest/"
+elif [ "${dest%/}" != "$dest" ]; then
+  mkdir -p "$dest"
+  cp -a "$1" "$dest/"
+else
+  mkdir -p "$(dirname "$dest")"
+  cp -a "$1" "$dest"
+fi"#;
 
 #[derive(Clone)]
 pub(crate) struct VmImageBuilder {
@@ -192,10 +209,15 @@ impl PreparedRootDisk {
             .await?
         } else {
             let (path, status) = prepare_flattened_disk(cache, final_image, disk_bytes).await?;
-            (path, status, final_image.config.environment.clone())
+            (
+                path,
+                status,
+                docker_process_environment(&final_image.config.environment),
+            )
         };
+        let shell = cached_prepared_shell(&path)?;
         Ok(Self {
-            shell: prepared_shell(&path)?.to_owned(),
+            shell,
             path,
             workdir: recipe.final_workdir().to_owned(),
             environment,
@@ -242,6 +264,14 @@ struct ReferenceRecord {
     layers: Vec<LayerRecord>,
     #[serde(default)]
     config: ImageRuntimeConfig,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PreparedDiskRecord {
+    version: u32,
+    file_bytes: u64,
+    modified_nanos: u128,
+    shell: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -559,7 +589,6 @@ async fn prepare_flattened_disk(
     let key = disk_cache_key(&image.manifest_digest, disk_bytes);
     let path = cache.join("images").join(format!("{key}.ext4"));
     if path.is_file() {
-        validate_ext4_disk(&path)?;
         return Ok((path, DiskStatus::Hit));
     }
     fs::create_dir_all(
@@ -597,7 +626,6 @@ async fn prepare_built_disk(
     let path = builds.join(format!("{key}.ext4"));
     let final_environment = final_recipe_environment(recipe, images)?;
     if path.is_file() {
-        validate_root_disk(&path)?;
         return Ok((path, DiskStatus::Hit, final_environment));
     }
 
@@ -853,10 +881,7 @@ async fn execute_stage_inner(
     let image = images
         .get(&stage.base_image)
         .ok_or_else(|| ImageError::UnknownCopySource(stage.base_image.clone()))?;
-    let mut environment = image.config.environment.clone();
-    environment
-        .entry("PATH".to_owned())
-        .or_insert_with(|| DEFAULT_GUEST_PATH.to_owned());
+    let mut environment = docker_process_environment(&image.config.environment);
     let mut arguments = BTreeMap::<String, String>::new();
     let mut workdir = image.config.working_directory.clone();
     if !valid_guest_workdir(&workdir) {
@@ -988,21 +1013,7 @@ async fn execute_copy(input: CopyExecution<'_>) -> Result<(), ImageError> {
     };
     let mut command = VmCommand::new("/bin/sh")
         .arg("-c")
-        .arg(
-            r#"set -eu
-dest=$1
-shift
-if [ "$#" -gt 1 ]; then
-  mkdir -p "$dest"
-  for src do cp -a "$src" "$dest/"; done
-elif [ -d "$1" ]; then
-  mkdir -p "$dest"
-  cp -a "$1/." "$dest/"
-else
-  mkdir -p "$(dirname "$dest")"
-  cp -a "$1" "$dest"
-fi"#,
-        )
+        .arg(COPY_SCRIPT)
         .arg("nanoeval-copy")
         .arg(destination)
         .timeout(BUILD_COPY_TIMEOUT);
@@ -1056,6 +1067,19 @@ fn build_environment(
     result.into_iter().collect()
 }
 
+fn docker_process_environment(
+    image_environment: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut environment = image_environment.clone();
+    environment
+        .entry("HOME".to_owned())
+        .or_insert_with(|| "/root".to_owned());
+    environment
+        .entry("PATH".to_owned())
+        .or_insert_with(|| DEFAULT_GUEST_PATH.to_owned());
+    environment
+}
+
 fn resolve_stage_index(recipe: &DockerfileRecipe, reference: &str) -> Option<usize> {
     reference.parse::<usize>().ok().or_else(|| {
         recipe
@@ -1084,7 +1108,7 @@ fn final_recipe_environment(
     let image = images
         .get(&stage.base_image)
         .ok_or_else(|| ImageError::UnknownCopySource(stage.base_image.clone()))?;
-    let mut environment = image.config.environment.clone();
+    let mut environment = docker_process_environment(&image.config.environment);
     let mut arguments = BTreeMap::new();
     for instruction in &stage.instructions {
         match instruction {
@@ -1424,6 +1448,40 @@ fn validate_root_disk(path: &Path) -> Result<(), ImageError> {
     Ok(())
 }
 
+fn cached_prepared_shell(path: &Path) -> Result<String, ImageError> {
+    let metadata = fs::metadata(path)?;
+    let modified_nanos = modified_nanos(&metadata)?;
+    let record_path = path.with_extension("prepared.json");
+    if let Some(record) = read_cache_record::<PreparedDiskRecord>(&record_path)?
+        && record.version == PREPARED_DISK_RECORD_VERSION
+        && record.file_bytes == metadata.len()
+        && record.modified_nanos == modified_nanos
+        && matches!(record.shell.as_str(), "bash" | "sh")
+    {
+        return Ok(record.shell);
+    }
+
+    let shell = prepared_shell(path)?.to_owned();
+    write_cache_record(
+        &record_path,
+        &PreparedDiskRecord {
+            version: PREPARED_DISK_RECORD_VERSION,
+            file_bytes: metadata.len(),
+            modified_nanos,
+            shell: shell.clone(),
+        },
+    )?;
+    Ok(shell)
+}
+
+fn modified_nanos(metadata: &fs::Metadata) -> io::Result<u128> {
+    metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .map_err(io::Error::other)
+}
+
 fn prepared_shell(path: &Path) -> Result<&'static str, ImageError> {
     let mut reader = Reader::new(path)?;
     if reader.exists("/bin/bash") {
@@ -1461,7 +1519,12 @@ fn reference_cache_key(image: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DockerfileRecipe, disk_cache_key, reference_cache_key};
+    use std::{collections::BTreeMap, fs, process::Command};
+
+    use super::{
+        COPY_SCRIPT, DockerfileRecipe, disk_cache_key, docker_process_environment,
+        reference_cache_key,
+    };
 
     #[test]
     fn accepts_the_first_proof_dockerfile() {
@@ -1474,6 +1537,42 @@ mod tests {
         );
         assert_eq!(recipe.final_workdir(), "/app");
         assert!(!recipe.requires_build());
+    }
+
+    #[test]
+    fn supplies_docker_root_process_defaults() {
+        let environment = docker_process_environment(&BTreeMap::new());
+
+        assert_eq!(environment.get("HOME").map(String::as_str), Some("/root"));
+        assert_eq!(
+            environment.get("PATH").map(String::as_str),
+            Some(super::DEFAULT_GUEST_PATH)
+        );
+    }
+
+    #[test]
+    fn copy_creates_a_missing_directory_for_a_trailing_slash_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("client.conf");
+        let destination = format!("{}/", temporary.path().join("etc/pipewire").display());
+        fs::write(&source, "configured").unwrap();
+
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                COPY_SCRIPT,
+                "nanoeval-copy",
+                &destination,
+                source.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("etc/pipewire/client.conf")).unwrap(),
+            "configured"
+        );
     }
 
     #[test]
