@@ -26,4 +26,7 @@ pub use result::{
     VerifierResult,
 };
 pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
-pub use task::{NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier};
+pub use task::{
+    NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier, VerifierCollect,
+    VerifierEnvironmentMode,
+};

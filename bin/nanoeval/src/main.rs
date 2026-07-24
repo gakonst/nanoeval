@@ -1,5 +1,6 @@
 mod compare;
 mod config;
+mod disk;
 mod eval;
 mod inspect;
 mod observability;
@@ -16,7 +17,7 @@ use std::{
 
 use clap::{CommandFactory, Parser, Subcommand};
 use eyre::{Result, eyre};
-use nanoeval::Task;
+use nanoeval::{Task, VerifierCollect, VerifierEnvironmentMode};
 use nanovm::{BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig};
 use serde::Serialize;
 
@@ -53,7 +54,7 @@ enum Command {
     /// Explain a retained Harbor job or trial and surface exact failure evidence.
     Inspect(inspect::Inspect),
 
-    /// Compare a task with successful attempts from Harbor's public archive.
+    /// Compare a task or retained job with Harbor's public archive.
     Compare(compare::Compare),
 
     /// Run one command in a libkrun microVM.
@@ -111,8 +112,12 @@ enum VmCommand {
         memory_mib: u32,
 
         /// Gvproxy unixgram socket used for an isolated virtio-net interface.
-        #[arg(long, value_name = "SOCKET")]
+        #[arg(long, value_name = "SOCKET", conflicts_with = "no_network")]
         network_socket: Option<PathBuf>,
+
+        /// Do not attach a guest network device.
+        #[arg(long)]
+        no_network: bool,
 
         /// Read-only directory containing the guest tool runtime.
         #[arg(long, value_name = "DIRECTORY")]
@@ -250,6 +255,7 @@ fn main() -> Result<()> {
                 cpus,
                 memory_mib,
                 network_socket,
+                no_network,
                 runtime_directory,
                 writable_share,
                 read_only_disk,
@@ -265,6 +271,7 @@ fn main() -> Result<()> {
             cpus: *cpus,
             memory_mib: *memory_mib,
             network_socket: network_socket.as_deref(),
+            no_network: *no_network,
             runtime_directory: runtime_directory.as_deref(),
             writable_shares: writable_share,
             read_only_disks: read_only_disk,
@@ -292,6 +299,7 @@ struct RunVm<'a> {
     cpus: u8,
     memory_mib: u32,
     network_socket: Option<&'a Path>,
+    no_network: bool,
     runtime_directory: Option<&'a Path>,
     writable_shares: &'a [WritableShare],
     read_only_disks: &'a [ReadOnlyDisk],
@@ -314,6 +322,8 @@ fn run_vm(input: RunVm<'_>) -> Result<()> {
     .memory_mib(input.memory_mib);
     if let Some(socket) = input.network_socket {
         config = config.network(Network::gvproxy(socket));
+    } else if input.no_network {
+        config = config.network(Network::Disabled);
     }
     if let Some(directory) = input.runtime_directory {
         config = config.shared_directory(SharedDirectory::read_only("nanoeval-tools", directory));
@@ -392,6 +402,37 @@ async fn prepare_tasks(
             task_started.elapsed()
         );
         println!("{}", prepared.path().display());
+        if task.verifier().environment_mode() == VerifierEnvironmentMode::Separate {
+            let verifier_started = Instant::now();
+            let verifier =
+                match vm_image::PreparedRootDisk::prepare_verifier(&task, &cache, policy, &builder)
+                    .await
+                {
+                    Ok(verifier) => verifier,
+                    Err(error) => {
+                        eprintln!(
+                            "{} verifier: failed duration={:.3?}\n{error:#}",
+                            task.name(),
+                            verifier_started.elapsed()
+                        );
+                        failures.push(format!("{} verifier", task.name()));
+                        continue;
+                    }
+                };
+            match verifier.disk_status() {
+                vm_image::DiskStatus::Hit => cache_hits += 1,
+                vm_image::DiskStatus::Created => cache_creations += 1,
+            }
+            eprintln!(
+                "{} verifier: manifest={} ({}) root_disk={} duration={:.3?}",
+                task.name(),
+                verifier.manifest_digest(),
+                verifier.manifest_source().as_str(),
+                verifier.disk_status().as_str(),
+                verifier_started.elapsed()
+            );
+            println!("{}", verifier.path().display());
+        }
     }
     eprintln!(
         "VM preparation: runtime={runtime_duration:.3?} environments={} hits={cache_hits} created={cache_creations} failed={} total={:.3?}",
@@ -454,6 +495,7 @@ async fn run(cli: Cli) -> Result<()> {
                     cpus,
                     memory_mib,
                     network_socket,
+                    no_network,
                     runtime_directory,
                     writable_share,
                     read_only_disk,
@@ -468,6 +510,7 @@ async fn run(cli: Cli) -> Result<()> {
                 cpus,
                 memory_mib,
                 network_socket: network_socket.as_deref(),
+                no_network,
                 runtime_directory: runtime_directory.as_deref(),
                 writable_shares: &writable_share,
                 read_only_disks: &read_only_disk,
@@ -489,6 +532,7 @@ struct TaskOutput<'a> {
     image: &'a str,
     agent_timeout_sec: f64,
     verifier: VerifierOutput<'a>,
+    artifacts: &'a [PathBuf],
     resources: ResourcesOutput,
     network: &'static str,
     environment: &'a BTreeMap<String, String>,
@@ -500,6 +544,8 @@ struct VerifierOutput<'a> {
     script: &'a Path,
     timeout_sec: f64,
     environment: &'a BTreeMap<String, String>,
+    environment_mode: VerifierEnvironmentMode,
+    collect: &'a [VerifierCollect],
 }
 
 #[derive(Serialize)]
@@ -523,7 +569,10 @@ impl<'a> From<&'a Task> for TaskOutput<'a> {
                 script: task.verifier().script(),
                 timeout_sec: task.verifier().timeout().as_secs_f64(),
                 environment: task.verifier().environment(),
+                environment_mode: task.verifier().environment_mode(),
+                collect: task.verifier().collect(),
             },
+            artifacts: task.artifacts(),
             resources: ResourcesOutput {
                 cpus: task.resources().cpus,
                 memory_mb: task.resources().memory_mb,
@@ -557,7 +606,13 @@ impl TaskOutput<'_> {
             self.resources.gpus
         )?;
         writeln!(output, "  network: {}", self.network)?;
-        writeln!(output, "  verifier: {}", self.verifier.script.display())?;
+        writeln!(
+            output,
+            "  verifier: {} ({})",
+            self.verifier.script.display(),
+            self.verifier.environment_mode.as_str()
+        )?;
+        writeln!(output, "  artifacts: {}", self.artifacts.len())?;
         writeln!(output, "  requires compose: {}", self.requires_compose)?;
         if include_prompt {
             writeln!(output, "\n{}", self.prompt)?;
@@ -633,5 +688,45 @@ mod tests {
         };
 
         assert_eq!(suites, [Path::new("terminal-bench-2-1").to_path_buf()]);
+    }
+
+    #[test]
+    fn vm_run_accepts_an_explicit_no_network_policy() {
+        let cli = Cli::try_parse_from([
+            "nanoeval",
+            "vm",
+            "run",
+            "--root",
+            "/tmp/rootfs.ext4",
+            "--ext4",
+            "--no-network",
+            "/bin/true",
+        ])
+        .unwrap();
+        let Some(Command::Vm {
+            command: VmCommand::Run { no_network, .. },
+        }) = cli.command
+        else {
+            panic!("expected vm run command");
+        };
+
+        assert!(no_network);
+    }
+
+    #[test]
+    fn vm_run_rejects_conflicting_network_policies() {
+        let parsed = Cli::try_parse_from([
+            "nanoeval",
+            "vm",
+            "run",
+            "--root",
+            "/tmp/rootfs.ext4",
+            "--network-socket",
+            "/tmp/gvproxy.sock",
+            "--no-network",
+            "/bin/true",
+        ]);
+
+        assert!(parsed.is_err());
     }
 }

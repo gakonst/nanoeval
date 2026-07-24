@@ -11,10 +11,9 @@ use thiserror::Error;
 use crate::{BlockDevice, GuestCommand, Network, RootFilesystem, SharedDirectory, VmConfig};
 
 const ROOT_TAG: &std::ffi::CStr = c"/dev/root";
-const ROOT_BLOCK_ID: &std::ffi::CStr = c"root";
+const ROOT_BLOCK_ID: &std::ffi::CStr = c"vda";
 const ROOT_BLOCK_DEVICE: &std::ffi::CStr = c"/dev/vda";
 const EXT4_FILESYSTEM: &std::ffi::CStr = c"ext4";
-const ROOT_MOUNT_OPTIONS: &std::ffi::CStr = c"rw";
 const TSI_HIJACK_INET: u32 = 1;
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
@@ -149,7 +148,7 @@ impl KrunVm {
                             context,
                             ROOT_BLOCK_DEVICE.as_ptr(),
                             EXT4_FILESYSTEM.as_ptr(),
-                            ROOT_MOUNT_OPTIONS.as_ptr(),
+                            ptr::null(),
                         )
                     },
                     "select root disk",

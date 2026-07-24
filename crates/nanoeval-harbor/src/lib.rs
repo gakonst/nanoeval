@@ -2,10 +2,10 @@ mod checksum;
 mod published;
 
 pub use published::{
-    PublishedAgent, PublishedAgentDetails, PublishedAgentInfo, PublishedError,
-    PublishedObservation, PublishedObservationResult, PublishedQuery, PublishedResults,
-    PublishedResultsBuilder, PublishedStep, PublishedStepId, PublishedTask, PublishedToolCall,
-    PublishedTrajectory, PublishedTrial,
+    PublishedAgent, PublishedAgentDetails, PublishedAgentInfo, PublishedAttempt, PublishedAttempts,
+    PublishedError, PublishedModelInfo, PublishedObservation, PublishedObservationResult,
+    PublishedQuery, PublishedResults, PublishedResultsBuilder, PublishedStep, PublishedStepId,
+    PublishedTask, PublishedToolCall, PublishedTrajectory, PublishedTrial,
 };
 
 use std::{
@@ -583,6 +583,12 @@ impl HarborArtifacts {
             .as_ref()
             .map_or_else(HarborJobStats::default, |baseline| baseline.stats.clone());
         HarborJobDelta::new(results, failures).apply(&mut stats);
+        for eval in stats.evals.values_mut() {
+            eval.pass_at_k.clear();
+        }
+        for (eval_key, pass_at_k) in compute_harbor_pass_at_k(&self.root)? {
+            stats.evals.entry(eval_key).or_default().pass_at_k = pass_at_k;
+        }
         let baseline_total = self
             .baseline
             .as_ref()
@@ -1128,6 +1134,133 @@ struct HarborAgentDatasetStats {
     exception_stats: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Deserialize)]
+struct HarborPassAtKTrial {
+    task_name: String,
+    source: Option<String>,
+    agent_info: HarborPassAtKAgent,
+    verifier_result: Option<HarborPassAtKVerifier>,
+}
+
+#[derive(Deserialize)]
+struct HarborPassAtKAgent {
+    name: String,
+    model_info: Option<HarborPassAtKModel>,
+}
+
+#[derive(Deserialize)]
+struct HarborPassAtKModel {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct HarborPassAtKVerifier {
+    rewards: BTreeMap<String, f64>,
+}
+
+fn compute_harbor_pass_at_k(
+    job: &Path,
+) -> Result<BTreeMap<String, BTreeMap<usize, f64>>, HarborError> {
+    let mut groups = BTreeMap::<String, Option<BTreeMap<String, Vec<u8>>>>::new();
+    for entry in fs::read_dir(job)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(trial) = HarborArtifacts::read_json_if_exists::<HarborPassAtKTrial>(
+            &entry.path().join("result.json"),
+        )?
+        else {
+            continue;
+        };
+        let model = trial
+            .agent_info
+            .model_info
+            .as_ref()
+            .map(|model| model.name.as_str());
+        let source = trial.source.as_deref().unwrap_or("adhoc");
+        let eval_key = model.map_or_else(
+            || format!("{}__{source}", trial.agent_info.name),
+            |model| format!("{}__{model}__{source}", trial.agent_info.name),
+        );
+        let success = match trial.verifier_result {
+            None => Some(0),
+            Some(verifier) if verifier.rewards.len() == 1 => {
+                match verifier
+                    .rewards
+                    .values()
+                    .next()
+                    .map(|reward| reward.to_bits())
+                {
+                    Some(bits) if bits == 0.0_f64.to_bits() => Some(0),
+                    Some(bits) if bits == 1.0_f64.to_bits() => Some(1),
+                    Some(_) | None => None,
+                }
+            }
+            Some(_) => None,
+        };
+        let group = groups
+            .entry(eval_key)
+            .or_insert_with(|| Some(BTreeMap::new()));
+        match (group.as_mut(), success) {
+            (Some(tasks), Some(success)) => {
+                tasks.entry(trial.task_name).or_default().push(success);
+            }
+            (_, None) => *group = None,
+            (None, Some(_)) => {}
+        }
+    }
+
+    Ok(groups
+        .into_iter()
+        .filter_map(|(eval_key, tasks)| {
+            compute_pass_at_k_for_tasks(&tasks?).map(|pass_at_k| (eval_key, pass_at_k))
+        })
+        .collect())
+}
+
+fn compute_pass_at_k_for_tasks(tasks: &BTreeMap<String, Vec<u8>>) -> Option<BTreeMap<usize, f64>> {
+    let min_trials = tasks.values().map(Vec::len).min()?;
+    let task_count = u32::try_from(tasks.len()).ok()?;
+    let mut pass_at_k = BTreeMap::new();
+    for k in eligible_k_values(min_trials) {
+        let k_u32 = u32::try_from(k).ok()?;
+        let mut estimate = 0.0;
+        for successes in tasks.values() {
+            let n = u32::try_from(successes.len()).ok()?;
+            let correct = successes.iter().map(|success| u32::from(*success)).sum();
+            estimate += pass_at_k_for_task(n, correct, k_u32);
+        }
+        pass_at_k.insert(k, estimate / f64::from(task_count));
+    }
+    Some(pass_at_k)
+}
+
+fn eligible_k_values(max_k: usize) -> Vec<usize> {
+    let mut values = std::collections::BTreeSet::new();
+    let mut k = 2;
+    while k <= max_k {
+        values.insert(k);
+        k *= 2;
+    }
+    let mut k = 5;
+    while k <= max_k {
+        values.insert(k);
+        k += 5;
+    }
+    values.into_iter().collect()
+}
+
+fn pass_at_k_for_task(n: u32, correct: u32, k: u32) -> f64 {
+    if n - correct < k {
+        return 1.0;
+    }
+    let failure_probability = (0..k).fold(1.0, |product, i| {
+        product * f64::from(n - correct - i) / f64::from(n - i)
+    });
+    1.0 - failure_probability
+}
+
 impl HarborAgentDatasetStats {
     fn merge_into(self, retained: &mut Self) {
         retained.n_trials += self.n_trials;
@@ -1153,14 +1286,14 @@ struct HarborMetric {}
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use nanocodex::{Nanocodex, OpenAiAuth};
     use nanoeval::{AtifTrajectory, Nanoeval, Sweep, Task};
     use serde::Deserialize;
     use tempfile::tempdir;
 
-    use super::Harbor;
+    use super::{Harbor, compute_pass_at_k_for_tasks, pass_at_k_for_task};
 
     #[derive(Deserialize)]
     struct TrialResult {
@@ -1187,6 +1320,22 @@ mod tests {
         errored: usize,
         #[serde(rename = "n_pending_trials")]
         pending: usize,
+    }
+
+    #[test]
+    fn pass_at_k_matches_harbors_unbiased_estimator() {
+        assert!((pass_at_k_for_task(5, 2, 2) - 0.7).abs() < f64::EPSILON);
+
+        let tasks = BTreeMap::from([
+            ("sometimes".to_owned(), vec![1, 0, 0, 0, 0]),
+            ("always".to_owned(), vec![1, 1, 1, 1, 1]),
+        ]);
+        let pass_at_k = compute_pass_at_k_for_tasks(&tasks).unwrap();
+
+        assert_eq!(pass_at_k.keys().copied().collect::<Vec<_>>(), [2, 4, 5]);
+        assert!((pass_at_k[&2] - 0.7).abs() < f64::EPSILON);
+        assert!((pass_at_k[&4] - 0.9).abs() < f64::EPSILON);
+        assert!((pass_at_k[&5] - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

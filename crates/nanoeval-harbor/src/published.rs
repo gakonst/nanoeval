@@ -134,18 +134,8 @@ impl PublishedResults {
     /// Returns an error when the archive index cannot be prepared, an artifact
     /// cannot be downloaded, or a published JSON document is malformed.
     pub async fn query(&self, query: &PublishedQuery) -> Result<PublishedTask, PublishedError> {
-        let index = self.prepare_index().await?;
-        let revision = self
-            .git_output(&index, "read archive revision", &["rev-parse", "HEAD"])
-            .await?
-            .trim()
-            .to_owned();
-        let candidates = self.load_task_paths(&index, &revision, &query.task).await?;
-        let matching_results = candidates.len();
-
-        let records = self
-            .load_task_results(&revision, &query.task, candidates)
-            .await?;
+        let (revision, records) = self.load_query_records(query).await?;
+        let matching_results = records.len();
 
         let mut passing = Vec::new();
         for record in records {
@@ -154,7 +144,7 @@ impl PublishedResults {
             if reward <= 0.0 || result.exception_info.is_some() {
                 continue;
             }
-            if !query.agent_matches(&candidate.submission, &result.agent_info) {
+            if !query.agent_matches(&candidate.submission, &result) {
                 continue;
             }
             passing.push((candidate, result, reward));
@@ -201,6 +191,15 @@ impl PublishedResults {
                     }
                     None => (None, None),
                 };
+                let thinking = result
+                    .config
+                    .as_ref()
+                    .and_then(PublishedTrialConfig::thinking);
+                let agent_import_path = result
+                    .config
+                    .as_ref()
+                    .and_then(PublishedTrialConfig::agent_import_path);
+                let agent = result.resolved_agent_info();
                 Ok::<_, PublishedError>(PublishedTrial {
                     submission: candidate.submission,
                     run: candidate.run,
@@ -208,7 +207,9 @@ impl PublishedResults {
                     task_name: result.task_name,
                     task_checksum: result.task_checksum,
                     reward,
-                    agent: result.agent_info,
+                    agent,
+                    thinking,
+                    agent_import_path,
                     result_path: candidate.result,
                     trajectory_path: candidate.trajectory,
                     trajectory,
@@ -231,6 +232,77 @@ impl PublishedResults {
             exact_passing_results,
             trials,
         })
+    }
+
+    /// Loads typed per-attempt metadata without downloading trajectories.
+    ///
+    /// This is the fast path for exact-revision aggregate comparisons across
+    /// multiple tasks or retained jobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the archive index cannot be prepared, a result
+    /// cannot be downloaded, or a published JSON document is malformed.
+    pub async fn attempts(
+        &self,
+        query: &PublishedQuery,
+    ) -> Result<PublishedAttempts, PublishedError> {
+        let (revision, records) = self.load_query_records(query).await?;
+        let attempts = records
+            .into_iter()
+            .filter(|record| query.agent_matches(&record.candidate.submission, &record.result))
+            .map(|record| {
+                let PublishedRecord { candidate, result } = record;
+                let passed = result.exception_info.is_none() && result.reward() > 0.0;
+                let errored = result.exception_info.is_some();
+                let thinking = result
+                    .config
+                    .as_ref()
+                    .and_then(PublishedTrialConfig::thinking);
+                let agent_import_path = result
+                    .config
+                    .as_ref()
+                    .and_then(PublishedTrialConfig::agent_import_path);
+                let agent = result.resolved_agent_info();
+                PublishedAttempt {
+                    submission: candidate.submission,
+                    run: candidate.run,
+                    task_name: result.task_name,
+                    task_checksum: result.task_checksum,
+                    trial_name: result.trial_name,
+                    passed,
+                    errored,
+                    agent,
+                    thinking,
+                    agent_import_path,
+                    result_path: candidate.result,
+                    trajectory_path: candidate.trajectory,
+                }
+            })
+            .collect();
+        Ok(PublishedAttempts {
+            task: query.task.clone(),
+            requested_checksum: query.checksum.clone(),
+            archive_revision: revision,
+            attempts,
+        })
+    }
+
+    async fn load_query_records(
+        &self,
+        query: &PublishedQuery,
+    ) -> Result<(String, Vec<PublishedRecord>), PublishedError> {
+        let index = self.prepare_index().await?;
+        let revision = self
+            .git_output(&index, "read archive revision", &["rev-parse", "HEAD"])
+            .await?
+            .trim()
+            .to_owned();
+        let candidates = self.load_task_paths(&index, &revision, &query.task).await?;
+        let records = self
+            .load_task_results(&revision, &query.task, candidates)
+            .await?;
+        Ok((revision, records))
     }
 
     async fn prepare_index(&self) -> Result<PathBuf, PublishedError> {
@@ -283,7 +355,7 @@ impl PublishedResults {
         let task_key = format!("{:x}", Sha256::digest(task.as_bytes()));
         let manifest = self
             .cache_directory
-            .join("task-results")
+            .join("task-results-v3")
             .join(revision)
             .join(format!("{task_key}.json"));
         if manifest.is_file() {
@@ -481,16 +553,21 @@ impl PublishedQuery {
             .is_some_and(|expected| checksum == expected)
     }
 
-    fn agent_matches(&self, submission: &str, agent: &PublishedAgentInfo) -> bool {
+    fn agent_matches(&self, submission: &str, result: &PublishedResult) -> bool {
         self.agents.is_empty()
             || self.agents.iter().any(|needle| {
                 let needle = needle.to_lowercase();
                 submission.to_lowercase().contains(&needle)
-                    || agent.name.to_lowercase().contains(&needle)
-                    || agent
+                    || result.agent_info.name.to_lowercase().contains(&needle)
+                    || result
+                        .agent_info
                         .model_info
                         .as_ref()
                         .is_some_and(|model| model.name.to_lowercase().contains(&needle))
+                    || result
+                        .config
+                        .as_ref()
+                        .is_some_and(|config| config.agent_matches(&needle))
             })
     }
 }
@@ -507,6 +584,30 @@ pub struct PublishedTask {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct PublishedAttempts {
+    pub task: String,
+    pub requested_checksum: Option<String>,
+    pub archive_revision: String,
+    pub attempts: Vec<PublishedAttempt>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PublishedAttempt {
+    pub submission: String,
+    pub run: String,
+    pub task_name: String,
+    pub task_checksum: String,
+    pub trial_name: String,
+    pub passed: bool,
+    pub errored: bool,
+    pub agent: PublishedAgentInfo,
+    pub thinking: Option<String>,
+    pub agent_import_path: Option<String>,
+    pub result_path: String,
+    pub trajectory_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct PublishedTrial {
     pub submission: String,
     pub run: String,
@@ -515,6 +616,8 @@ pub struct PublishedTrial {
     pub task_checksum: String,
     pub reward: f64,
     pub agent: PublishedAgentInfo,
+    pub thinking: Option<String>,
+    pub agent_import_path: Option<String>,
     pub result_path: String,
     pub trajectory_path: Option<String>,
     pub trajectory: Option<PublishedTrajectory>,
@@ -540,8 +643,57 @@ struct PublishedResult {
     task_checksum: String,
     trial_name: String,
     agent_info: PublishedAgentInfo,
+    #[serde(default)]
+    config: Option<PublishedTrialConfig>,
     verifier_result: Option<PublishedVerifierResult>,
     exception_info: Option<Box<RawValue>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PublishedTrialConfig {
+    agent: PublishedAgentConfig,
+}
+
+impl PublishedTrialConfig {
+    fn thinking(&self) -> Option<String> {
+        self.agent
+            .kwargs
+            .effort
+            .clone()
+            .or_else(|| self.agent.kwargs.reasoning_effort.clone())
+    }
+
+    fn agent_import_path(&self) -> Option<String> {
+        self.agent.import_path.clone()
+    }
+
+    fn agent_matches(&self, needle: &str) -> bool {
+        self.agent
+            .model_name
+            .as_ref()
+            .is_some_and(|model| model.to_lowercase().contains(needle))
+            || self
+                .agent
+                .import_path
+                .as_ref()
+                .is_some_and(|path| path.to_lowercase().contains(needle))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PublishedAgentConfig {
+    #[serde(default)]
+    model_name: Option<String>,
+    #[serde(default)]
+    import_path: Option<String>,
+    #[serde(default)]
+    kwargs: PublishedAgentKwargs,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PublishedAgentKwargs {
+    effort: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 impl PublishedResult {
@@ -551,6 +703,22 @@ impl PublishedResult {
             .and_then(|result| result.rewards.get("reward"))
             .copied()
             .unwrap_or(0.0)
+    }
+
+    fn resolved_agent_info(&self) -> PublishedAgentInfo {
+        let mut agent = self.agent_info.clone();
+        if agent.model_info.is_none()
+            && let Some(model) = self
+                .config
+                .as_ref()
+                .and_then(|config| config.agent.model_name.as_ref())
+        {
+            agent.model_info = Some(PublishedModelInfo {
+                name: model.strip_prefix("openai/").unwrap_or(model).to_owned(),
+                provider: None,
+            });
+        }
+        agent
     }
 }
 
@@ -633,6 +801,7 @@ pub struct PublishedObservation {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PublishedObservationResult {
+    #[serde(default)]
     pub source_call_id: String,
     pub content: String,
 }

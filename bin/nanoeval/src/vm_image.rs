@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tracing::info;
 
+use crate::disk::reflink_or_sparse_copy;
+
 const BLOCK_SIZE: u32 = 4_096;
 const MINIMUM_DISK_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_RECORD_VERSION: u32 = 2;
@@ -187,12 +189,43 @@ impl PreparedRootDisk {
         policy: CachePolicy,
         builder: &VmImageBuilder,
     ) -> Result<Self, ImageError> {
-        let dockerfile_path = task.environment_directory().join("Dockerfile");
+        Self::prepare_directory(
+            &task.environment_directory(),
+            task.resources().storage_mb,
+            cache,
+            policy,
+            builder,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_verifier(
+        task: &Task,
+        cache: &Path,
+        policy: CachePolicy,
+        builder: &VmImageBuilder,
+    ) -> Result<Self, ImageError> {
+        Self::prepare_directory(
+            &task.root().join("tests"),
+            task.resources().storage_mb,
+            cache,
+            policy,
+            builder,
+        )
+        .await
+    }
+
+    async fn prepare_directory(
+        directory: &Path,
+        storage_mb: u64,
+        cache: &Path,
+        policy: CachePolicy,
+        builder: &VmImageBuilder,
+    ) -> Result<Self, ImageError> {
+        let dockerfile_path = directory.join("Dockerfile");
         let dockerfile = fs::read_to_string(&dockerfile_path)?;
         let recipe = DockerfileRecipe::parse(&dockerfile)?;
-        let disk_bytes = task
-            .resources()
-            .storage_mb
+        let disk_bytes = storage_mb
             .saturating_mul(1024 * 1024)
             .max(MINIMUM_DISK_BYTES);
         let images = resolve_recipe_images(&recipe, cache, policy).await?;
@@ -202,7 +235,7 @@ impl PreparedRootDisk {
             .ok_or_else(|| ImageError::UnknownCopySource(final_stage.base_image.clone()))?;
         let (path, disk_status, environment) = if recipe.requires_build() {
             prepare_built_disk(
-                task,
+                directory,
                 &dockerfile,
                 &recipe,
                 &images,
@@ -610,7 +643,7 @@ async fn prepare_flattened_disk(
 }
 
 async fn prepare_built_disk(
-    task: &Task,
+    context_directory: &Path,
     dockerfile: &str,
     recipe: &DockerfileRecipe,
     images: &BTreeMap<String, PulledImage>,
@@ -618,10 +651,10 @@ async fn prepare_built_disk(
     disk_bytes: u64,
     builder: &VmImageBuilder,
 ) -> Result<(PathBuf, DiskStatus, BTreeMap<String, String>), ImageError> {
-    let environment_directory = task.environment_directory().clone();
+    let context_directory = context_directory.to_path_buf();
     let context_cache = cache.to_path_buf();
     let (context_image, context_digest) = tokio::task::spawn_blocking(move || {
-        prepare_context_disk(&environment_directory, &context_cache, disk_bytes)
+        prepare_context_disk(&context_directory, &context_cache, disk_bytes)
     })
     .await??;
     let key = build_cache_key(dockerfile, &context_digest, recipe, images, disk_bytes);
@@ -643,7 +676,7 @@ async fn prepare_built_disk(
             .ok_or_else(|| ImageError::UnknownCopySource(stage.base_image.clone()))?;
         let (base, _) = prepare_flattened_disk(cache, image, disk_bytes).await?;
         let stage_root = temporary.path().join(format!("stage-{stage_index}.ext4"));
-        reflink_copy::reflink(&base, &stage_root)?;
+        reflink_or_sparse_copy(&base, &stage_root)?;
         execute_stage(
             stage_index,
             stage,
@@ -661,7 +694,7 @@ async fn prepare_built_disk(
     }
     let final_stage = stage_disks.last().ok_or(ImageError::InvalidFrom)?;
     let published = path.with_extension(format!("{}.tmp", std::process::id()));
-    reflink_copy::reflink(final_stage, &published)?;
+    reflink_or_sparse_copy(final_stage, &published)?;
     fs::rename(published, &path)?;
     validate_root_disk(&path)?;
     Ok((path, DiskStatus::Created, final_environment))
@@ -1235,7 +1268,19 @@ fn build_cache_key(
 }
 
 fn host_resolver_configuration() -> io::Result<String> {
-    let contents = fs::read_to_string("/etc/resolv.conf")?;
+    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        let configuration = resolver_configuration(&contents);
+        if !configuration.is_empty() {
+            return Ok(configuration);
+        }
+    }
+    Err(io::Error::other("host resolver has no usable nameserver"))
+}
+
+fn resolver_configuration(contents: &str) -> String {
     let mut configuration = String::new();
     for line in contents.lines() {
         let mut fields = line.split_whitespace();
@@ -1245,17 +1290,17 @@ fn host_resolver_configuration() -> io::Result<String> {
         let Some(address) = fields.next() else {
             continue;
         };
-        if fields.next().is_some() || address.parse::<std::net::IpAddr>().is_err() {
+        let Ok(address) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if fields.next().is_some() || address.is_loopback() || address.is_unspecified() {
             continue;
         }
         configuration.push_str("nameserver ");
-        configuration.push_str(address);
+        configuration.push_str(&address.to_string());
         configuration.push_str("\\n");
     }
-    if configuration.is_empty() {
-        return Err(io::Error::other("host resolver has no usable nameserver"));
-    }
-    Ok(configuration)
+    configuration
 }
 
 #[derive(Clone)]
@@ -1346,7 +1391,7 @@ async fn pull_layers(image: &str, blobs: &Path) -> Result<PulledImage, ImageErro
         source,
     })?;
     let config = ClientConfig {
-        platform_resolver: Some(Box::new(linux_arm64_manifest)),
+        platform_resolver: Some(Box::new(linux_guest_manifest)),
         ..ClientConfig::default()
     };
     let client = Client::new(config);
@@ -1414,12 +1459,18 @@ fn valid_digest(digest: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn linux_arm64_manifest(manifests: &[ImageIndexEntry]) -> Option<String> {
+fn linux_guest_manifest(manifests: &[ImageIndexEntry]) -> Option<String> {
+    #[cfg(target_arch = "aarch64")]
+    const GUEST_ARCHITECTURE: &str = "arm64";
+    #[cfg(target_arch = "x86_64")]
+    const GUEST_ARCHITECTURE: &str = "amd64";
+
     manifests
         .iter()
         .find(|entry| {
             entry.platform.as_ref().is_some_and(|platform| {
-                platform.os.to_string() == "linux" && platform.architecture.to_string() == "arm64"
+                platform.os.to_string() == "linux"
+                    && platform.architecture.to_string() == GUEST_ARCHITECTURE
             })
         })
         .map(|entry| entry.digest.clone())
@@ -1536,7 +1587,7 @@ mod tests {
 
     use super::{
         COPY_SCRIPT, DockerfileRecipe, disk_cache_key, docker_process_environment, output_tail,
-        reference_cache_key,
+        reference_cache_key, resolver_configuration,
     };
 
     #[test]
@@ -1560,6 +1611,16 @@ mod tests {
         assert_eq!(
             environment.get("PATH").map(String::as_str),
             Some(super::DEFAULT_GUEST_PATH)
+        );
+    }
+
+    #[test]
+    fn resolver_configuration_rejects_host_local_stubs() {
+        assert_eq!(
+            resolver_configuration(
+                "nameserver 127.0.0.53\nnameserver ::1\nnameserver 213.186.33.99\n"
+            ),
+            "nameserver 213.186.33.99\\n"
         );
     }
 

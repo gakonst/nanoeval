@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
-use nanocodex::{Nanocodex, NanocodexBuilder, OpenAiAuth, Thinking};
+use nanocodex::{Nanocodex, NanocodexBuilder, OpenAiAuth, Thinking, Tools};
 
 #[derive(Args)]
 pub(crate) struct AgentArgs {
@@ -14,19 +14,28 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "NANOCODEX_AUTH_FILE")]
     auth_file: Option<PathBuf>,
 
-    /// Reasoning effort used by every fresh task agent.
+    /// Reasoning effort used by every fresh task agent. Fresh runs default to medium.
     #[arg(long, env = "OPENAI_REASONING_EFFORT")]
     thinking: Option<Thinking>,
+
+    /// Allow the agent to search the public web. Disabled by default for eval integrity.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    web_search: Option<bool>,
 }
 
 impl AgentArgs {
-    pub(crate) fn builder(self, thinking: Thinking) -> Result<NanocodexBuilder> {
+    pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
         let auth = Self::select_auth(self.api_key, self.auth_file, Self::environment_api_key()?)?;
-        Ok(Nanocodex::builder(auth).thinking(thinking))
+        let tools = Tools::builder().web_search(web_search).build()?;
+        Ok(Nanocodex::builder(auth).thinking(thinking).tools(tools))
     }
 
     pub(crate) const fn thinking(&self) -> Option<Thinking> {
         self.thinking
+    }
+
+    pub(crate) const fn web_search(&self) -> Option<bool> {
+        self.web_search
     }
 
     fn select_auth(

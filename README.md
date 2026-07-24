@@ -139,12 +139,16 @@ content-addressed, entitled copy of the host binary. Cargo may replace its
 ordinary output with an unsigned linker artifact without invalidating the
 signed copy or causing a broken VMM child.
 
-Each attempt also receives its own gvproxy-backed virtio-net interface. Nanoeval
-downloads the pinned, checksummed gvproxy release once into `.cache/vm` (or uses
-`NANOEVAL_GVPROXY`/`PATH`) and owns that process for exactly the guest lifetime.
-Guest loopback and listening ports are therefore private per attempt; concurrent
-tasks may both bind `localhost:8080` without reaching each other or a host
-service.
+Nanoeval enforces the task's Harbor network policy at the VM boundary. A task
+with `allow_internet = true` receives its own gvproxy-backed virtio-net
+interface; a task with `allow_internet = false` receives no guest network
+device. Removing `curl` is neither necessary nor sufficient because any other
+socket-capable program could replace it. Nanoeval downloads the pinned,
+checksummed gvproxy release once into `.cache/vm` (or uses
+`NANOEVAL_GVPROXY`/`PATH`) and owns each public-network process for exactly the
+guest lifetime. Guest loopback and listening ports remain private per attempt,
+so concurrent tasks may both bind `localhost:8080` without reaching each other
+or a host service.
 
 Prepare one or more Terminal-Bench 2.1 environments without running agents:
 
@@ -164,6 +168,29 @@ environment hits and creations and the total in-process duration. The guest
 runtime is prepared once for the whole command. Pass `--refresh` to the
 standalone command, or `--vm-refresh` to `nanoeval run`, when intentionally
 checking whether a mutable image reference now resolves to different content.
+
+Frontier-Bench v0.1 tasks use distinct agent and verifier images plus an
+explicit artifact handoff. Nanoeval prepares both immutable images, runs the
+agent in a CoW microVM, archives only the task's declared artifacts, shuts that
+guest down, and verifies the artifacts in a fresh CoW microVM:
+
+```sh
+cargo run -- vm prepare \
+  --task /path/to/frontier-bench/tasks/bun-sourcemap-leak
+
+cargo run -- run \
+  --task /path/to/frontier-bench/tasks/bun-sourcemap-leak \
+  --trials 1 \
+  --thinking max \
+  --vm
+```
+
+Both image builds are content-addressed and warm preparation is a cache lookup.
+The resulting job, trial, reward, verifier output, CTRF, and ATIF-v1.7
+trajectory remain directly readable by `harbor view`. This first vertical
+slice covers single-container Linux/aarch64 tasks with path artifacts and a
+`separate` verifier. Service-qualified artifacts, multi-container tasks, GPUs,
+and the other Frontier schema variants are not yet claimed as supported.
 
 The same repeated-task shape works for one concurrent VM-backed eval job:
 
@@ -295,6 +322,24 @@ cargo run -- compare configure-git-webserver \
   --agent terminus \
   --limit 3 \
   --full
+
+# Rank exact-revision published runs against every task in a retained k=5 job.
+cargo run -- compare nanoeval-runs/<job-id>
+
+# Compare harness + model + published thinking configuration on one task.
+cargo run -- compare nanoeval-runs/<job-id> \
+  --task pytorch-model-recovery
+
+# Diff one local ATIF against a successful published harness trajectory.
+cargo run -- compare nanoeval-runs/<job-id> \
+  --task pytorch-model-recovery \
+  --show Terminus2__GPT-5.3-Codex
+
+# Include complete reasoning and tool observations in that trajectory diff.
+cargo run -- compare nanoeval-runs/<job-id> \
+  --task pytorch-model-recovery \
+  --show Terminus2__GPT-5.3-Codex \
+  --full
 ```
 
 The first lookup creates a metadata-only Git index and downloads matching
@@ -306,6 +351,28 @@ ATIF also show their ordered messages, tool calls, and optionally complete
 reasoning and observations. `--json` returns the same typed library result
 without the human projection, and `--refresh` checks for a newer archive
 revision.
+
+Passing a retained job uses each trial's exact task checksum, queries all tasks
+concurrently, and compares only published runs that cover the complete exact
+task set. The steady-state path reads cached typed result manifests and does
+not download trajectories. `--task` narrows the job to one task and ranks every
+published harness/run for that exact revision by pass@k and raw trial success.
+Other published revisions are reported separately with their checksums and
+must not be treated as exact comparisons. Reasoning effort is verified from
+each local trial's `run.started` event, shown as published configuration for
+competitors, and labeled `not published` when the archive contains no evidence.
+`--show` accepts a submission, harness, or model selector but rejects ambiguous
+matches with the exact submission names to choose from.
+
+Fresh CLI runs default to `medium` when `--thinking` and
+`OPENAI_REASONING_EFFORT` are both omitted; reruns inherit the retained job's
+level. Every run prints the resolved thinking, trial count, concurrency, and
+host-versus-microVM environment before evaluation starts. The dedicated web
+search tool is disabled by default for eval integrity; `--web-search` opts into
+it explicitly and the choice is retained across resume and rerun. This tool
+policy is separate from a task's declared guest network policy. Terminal-Bench
+2.1's legacy `allow_internet` maps to Harbor's `public` and `no-network` modes;
+Nanoeval honors it when launching the VM.
 
 Every `--task` is one eval and the CLI defaults to `k=5`: five fresh independent
 attempts per task. Run the complete three-eval suite with:
@@ -1031,8 +1098,9 @@ cargo run -- vm run --root /path/to/rootfs -- /bin/uname -a
 The Nanocodex harness remains outside the untrusted task guest while its
 standard tools target that guest. Verification stays in the same live guest,
 but tests remain hidden until the agent phase ends. Each attempt owns a private
-CoW disk, VMM process, guest process tree, loopback namespace, and gvproxy
-network stack.
+CoW disk, VMM process, guest process tree, and loopback namespace. Public tasks
+also own a private gvproxy network stack; no-network tasks have no attached
+network device.
 
 See [`PLAN.md`](PLAN.md) for the ordered implementation plan,
 [`HARNESS_PLACEMENT.md`](HARNESS_PLACEMENT.md) for the measured harness-placement
@@ -1091,11 +1159,12 @@ output needed to inspect and compare runs with Harbor tooling.
 
 ## Current tradeoffs
 
-Nanoeval intentionally supports one agent SDK and one Terminal-Bench verifier
+Nanoeval intentionally supports one agent SDK and a narrow Harbor task
 contract. Native mode offers workspace disposability but no hostile-code
 containment. The VM path directly materializes every environment recipe in the
-89-task Terminal-Bench 2.1 suite on Linux/ARM64, but currently boots one
-libkrun guest per attempt rather than pooling warm multi-attempt workers.
+89-task Terminal-Bench 2.1 suite on Linux/ARM64 and the initial
+single-container Frontier-Bench path, but currently boots one libkrun guest per
+attempt rather than pooling warm multi-attempt workers.
 Hardware CPU and memory boundaries come from the VM; job-level weighted memory
 admission uses task declarations, while weighted CPU admission, sealed VM
 snapshots, architectures other than the host, and task-specific outbound-network

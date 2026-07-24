@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const TASK_CONFIG: &str = "task.toml";
 const TASK_INSTRUCTION: &str = "instruction.md";
@@ -22,6 +22,7 @@ pub struct Task {
     image: OciImage,
     agent_timeout: Duration,
     verifier: Verifier,
+    artifacts: Vec<PathBuf>,
     resources: Resources,
     network: NetworkPolicy,
     environment: BTreeMap<String, String>,
@@ -38,6 +39,21 @@ pub struct Verifier {
     script: PathBuf,
     timeout: Duration,
     environment: BTreeMap<String, String>,
+    environment_mode: VerifierEnvironmentMode,
+    collect: Vec<VerifierCollect>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifierEnvironmentMode {
+    #[default]
+    Same,
+    Separate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VerifierCollect {
+    command: Box<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,11 +156,10 @@ impl Task {
         }
 
         let name = required_string(&config_path, "task.name", raw.task.name)?;
-        let image = required_string(
-            &config_path,
-            "environment.docker_image",
-            raw.environment.docker_image,
-        )?;
+        let image = raw
+            .environment
+            .docker_image
+            .unwrap_or_else(|| "local-dockerfile".to_owned());
 
         Ok(Self {
             root,
@@ -163,7 +178,10 @@ impl Task {
                     raw.verifier.timeout_sec,
                 )?,
                 environment: raw.verifier.env,
+                environment_mode: raw.verifier.environment_mode,
+                collect: raw.verifier.collect,
             },
+            artifacts: raw.artifacts,
             resources: Resources {
                 cpus: positive(&config_path, "environment.cpus", raw.environment.cpus)?,
                 memory_mb: positive(
@@ -231,6 +249,11 @@ impl Task {
     }
 
     #[must_use]
+    pub fn artifacts(&self) -> &[PathBuf] {
+        &self.artifacts
+    }
+
+    #[must_use]
     pub const fn resources(&self) -> &Resources {
         &self.resources
     }
@@ -263,7 +286,7 @@ impl NetworkPolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Public => "public",
-            Self::Disabled => "disabled",
+            Self::Disabled => "no-network",
         }
     }
 }
@@ -283,11 +306,40 @@ impl Verifier {
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
+
+    #[must_use]
+    pub const fn environment_mode(&self) -> VerifierEnvironmentMode {
+        self.environment_mode
+    }
+
+    #[must_use]
+    pub fn collect(&self) -> &[VerifierCollect] {
+        &self.collect
+    }
+}
+
+impl VerifierCollect {
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+}
+
+impl VerifierEnvironmentMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Separate => "separate",
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct RawTask {
     schema_version: String,
+    #[serde(default)]
+    artifacts: Vec<PathBuf>,
     task: RawTaskInfo,
     #[serde(default)]
     metadata: RawMetadata,
@@ -319,11 +371,16 @@ struct RawVerifier {
     timeout_sec: f64,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    environment_mode: VerifierEnvironmentMode,
+    #[serde(default)]
+    collect: Vec<VerifierCollect>,
 }
 
 #[derive(Deserialize)]
 struct RawEnvironment {
-    docker_image: String,
+    #[serde(default)]
+    docker_image: Option<String>,
     cpus: u32,
     memory_mb: u64,
     storage_mb: u64,
@@ -335,6 +392,44 @@ struct RawEnvironment {
     custom_docker_compose: bool,
     #[serde(default)]
     env: BTreeMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for VerifierEnvironmentMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "same" => Ok(Self::Same),
+            "separate" => Ok(Self::Separate),
+            mode => Err(serde::de::Error::unknown_variant(
+                mode,
+                &["same", "separate"],
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for VerifierCollect {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawCollect {
+            command: String,
+        }
+
+        let raw = RawCollect::deserialize(deserializer)?;
+        if raw.command.trim().is_empty() {
+            return Err(serde::de::Error::custom(
+                "verifier collect command must not be empty",
+            ));
+        }
+        Ok(Self {
+            command: raw.command.into_boxed_str(),
+        })
+    }
 }
 
 const fn enabled() -> bool {
@@ -415,11 +510,11 @@ fn is_canary(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use tempfile::tempdir;
 
-    use super::{NetworkPolicy, Task};
+    use super::{NetworkPolicy, Task, VerifierEnvironmentMode};
 
     #[test]
     fn loads_terminal_bench_2_1_task_directory() {
@@ -505,6 +600,60 @@ storage_mb = 1
 
         let error = Task::load(directory.path()).unwrap_err();
         assert!(error.to_string().contains("tests/test.sh"));
+    }
+
+    #[test]
+    fn loads_frontier_bench_task_with_a_separate_verifier() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("tests")).unwrap();
+        fs::create_dir(directory.path().join("environment")).unwrap();
+        fs::write(
+            directory.path().join("task.toml"),
+            r#"
+schema_version = "1.1"
+artifacts = ["/app/output.txt"]
+
+[task]
+name = "terminal-bench/frontier-example"
+
+[agent]
+timeout_sec = 900.0
+
+[verifier]
+timeout_sec = 600.0
+environment_mode = "separate"
+
+[[verifier.collect]]
+command = "cp /app/output.txt /tmp/output.txt"
+
+[environment]
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+"#,
+        )
+        .unwrap();
+        fs::write(directory.path().join("instruction.md"), "Fix the task.").unwrap();
+        fs::write(
+            directory.path().join("environment/Dockerfile"),
+            "FROM scratch\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("tests/Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(directory.path().join("tests/test.sh"), "#!/bin/sh\n").unwrap();
+
+        let task = Task::load(directory.path()).unwrap();
+
+        assert_eq!(task.image().reference(), "local-dockerfile");
+        assert_eq!(
+            task.verifier().environment_mode(),
+            VerifierEnvironmentMode::Separate
+        );
+        assert_eq!(task.artifacts(), [PathBuf::from("/app/output.txt")]);
+        assert_eq!(
+            task.verifier().collect()[0].command(),
+            "cp /app/output.txt /tmp/output.txt"
+        );
     }
 
     #[test]

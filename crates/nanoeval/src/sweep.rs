@@ -39,14 +39,14 @@ pub(crate) struct SweepAttempt<'a> {
     trial: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RunManifest {
     tasks: Vec<RunTask>,
     agents: Vec<AgentId>,
     trials: NonZeroU16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 struct RunTask {
     root: PathBuf,
 }
@@ -159,11 +159,14 @@ impl Sweep {
     }
 
     pub(crate) fn attempts(&self) -> impl Iterator<Item = SweepAttempt<'_>> {
+        let tasks = &self.tasks;
         let agents = &self.agents;
         let trials = self.trials.get();
-        self.tasks.iter().flat_map(move |task| {
-            agents.iter().flat_map(move |agent| {
-                (1..=trials).map(move |trial| SweepAttempt { task, agent, trial })
+        (1..=trials).flat_map(move |trial| {
+            tasks.iter().flat_map(move |task| {
+                agents
+                    .iter()
+                    .map(move |agent| SweepAttempt { task, agent, trial })
             })
         })
     }
@@ -188,6 +191,25 @@ impl RunManifest {
         self.tasks.len() * self.agents.len() * usize::from(self.trials.get())
     }
 }
+
+impl PartialEq for RunManifest {
+    fn eq(&self, other: &Self) -> bool {
+        if self.trials != other.trials
+            || self.agents != other.agents
+            || self.tasks.len() != other.tasks.len()
+        {
+            return false;
+        }
+
+        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
+        let mut other_tasks = other.tasks.iter().collect::<Vec<_>>();
+        tasks.sort_unstable();
+        other_tasks.sort_unstable();
+        tasks == other_tasks
+    }
+}
+
+impl Eq for RunManifest {}
 
 impl fmt::Debug for SweepAgent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -344,9 +366,38 @@ mod tests {
         assert_eq!(sweep.attempt_count(), 8);
         assert_eq!(expanded[0].1, "low");
         assert_eq!(expanded[0].2, 1);
-        assert_eq!(expanded[1].2, 2);
-        assert_eq!(expanded[2].1, "high");
-        assert_eq!(expanded[4].0, "nanoeval/uppercase-message");
+        assert_eq!(expanded[1].1, "high");
+        assert_eq!(expanded[2].0, "nanoeval/uppercase-message");
+        assert_eq!(expanded[4].2, 2);
+    }
+
+    #[test]
+    fn manifest_identity_ignores_task_priority_order() {
+        let tasks = vec![load_task("write-greeting"), load_task("uppercase-message")];
+        let first = Sweep::builder()
+            .tasks(tasks.clone())
+            .agent("default", Nanocodex::builder("test-key"))
+            .unwrap()
+            .build()
+            .unwrap();
+        let second = Sweep::builder()
+            .tasks(tasks.into_iter().rev().collect())
+            .agent("default", Nanocodex::builder("test-key"))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(first.manifest(), second.manifest());
+        assert_ne!(
+            first
+                .attempts()
+                .map(|attempt| attempt.task().name().to_owned())
+                .collect::<Vec<_>>(),
+            second
+                .attempts()
+                .map(|attempt| attempt.task().name().to_owned())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
