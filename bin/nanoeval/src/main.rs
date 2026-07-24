@@ -1,3 +1,4 @@
+mod cleanup;
 mod compare;
 mod config;
 mod disk;
@@ -56,6 +57,9 @@ enum Command {
 
     /// Compare a task or retained job with Harbor's public archive.
     Compare(compare::Compare),
+
+    /// Remove disposable VM disks from completed retained trials.
+    Cleanup(cleanup::Cleanup),
 
     /// Run one command in a libkrun microVM.
     Vm {
@@ -478,6 +482,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Inspect(command) => command.run()?,
         Command::Compare(command) => command.run().await?,
+        Command::Cleanup(command) => command.run()?,
         Command::Vm {
             command:
                 VmCommand::Prepare {

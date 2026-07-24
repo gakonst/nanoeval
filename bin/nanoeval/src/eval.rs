@@ -1536,6 +1536,7 @@ const VM_GUEST_RUNTIME_RECORD_VERSION: u32 = 2;
 const VM_GUEST_RUNTIME_DISK_BYTES: u64 = 128 * 1024 * 1024;
 const VERIFIER_CACHE_VERSION: u32 = 2;
 const MINIMUM_VERIFIER_CACHE_DISK_BYTES: u64 = 512 * 1024 * 1024;
+const MAXIMUM_VERIFIER_CACHE_DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const VERIFIER_SETUP_MARKER: &str = "# Check if we're in a valid working directory";
 const VERIFIER_CACHE_BLOCK_ID: &str = "nanoeval-verifier-cache";
 const VERIFIER_CACHE_BLOCK_DEVICE: &str = "/dev/vdc";
@@ -2187,7 +2188,10 @@ impl VerifierCache {
             .resources()
             .storage_mb
             .saturating_mul(1024 * 1024)
-            .max(MINIMUM_VERIFIER_CACHE_DISK_BYTES);
+            .clamp(
+                MINIMUM_VERIFIER_CACHE_DISK_BYTES,
+                MAXIMUM_VERIFIER_CACHE_DISK_BYTES,
+            );
         digest.update(disk_bytes.to_le_bytes());
         let key = format!("{:x}", digest.finalize());
         let root = cache.join("verifiers").join(&key);
@@ -2587,6 +2591,22 @@ impl VmVerifier {
         Ok(())
     }
 
+    fn remove_attempt_cache(&mut self) {
+        let Some(attempt_cache) = self.attempt_cache.take() else {
+            return;
+        };
+        match fs::remove_file(&attempt_cache.disk) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                target: "nanoeval",
+                verifier_cache_path = %attempt_cache.disk.display(),
+                %error,
+                "failed to remove disposable attempt verifier cache"
+            ),
+        }
+    }
+
     fn remove_passed_root_disks(&self) {
         for launch in std::iter::once(&self.launch).chain(self.separate_launch.as_ref()) {
             if !launch.ext4 {
@@ -2793,6 +2813,12 @@ impl VmVerifier {
             }
             Ok(())
         })
+    }
+}
+
+impl Drop for VmVerifier {
+    fn drop(&mut self) {
+        self.remove_attempt_cache();
     }
 }
 

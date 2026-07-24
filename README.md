@@ -386,6 +386,21 @@ cargo run -- run \
   --thinking low
 ```
 
+Successful VM disks are disposable by default; `--vm-retention all` is the
+explicit debugging override. Failed, refused, and errored attempts retain their
+root disks so their final guest state remains inspectable. Remove only
+disposable disks from completed trials—without touching active VMs, results,
+trajectories, workspaces, or verifier output—with one command:
+
+```sh
+nanoeval cleanup nanoeval-runs/<job-id>
+
+# Preview the reclaimed physical allocation first.
+nanoeval cleanup --dry-run nanoeval-runs/<job-id>
+```
+
+The cleanup path may also be a parent containing multiple retained jobs.
+
 Nanoeval retains every trial separately. Its task-level pass@5 is whether at
 least one of the five trials passes; per-trial rewards remain available for
 mean-success and variance reporting.
