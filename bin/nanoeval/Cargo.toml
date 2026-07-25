@@ -17,6 +17,7 @@ clap.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
 flate2.workspace = true
+fs2.workspace = true
 ignore.workspace = true
 nanocodex.workspace = true
 nanocodex-observability.workspace = true

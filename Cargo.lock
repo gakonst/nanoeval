@@ -2126,6 +2126,7 @@ dependencies = [
  "dotenvy",
  "eyre",
  "flate2",
+ "fs2",
  "ignore",
  "nanocodex",
  "nanocodex-observability",
