@@ -557,7 +557,7 @@ impl Eval {
                         runtime_image: &runtime_image,
                         vmm: &vmm,
                         gvproxy: gvproxy.as_deref(),
-                        retain_passed_rootfs: resolved.vm_retention.retains_passes(),
+                        retention: resolved.vm_retention,
                         web_search: resolved.web_search,
                     },
                     attempt,
@@ -1269,6 +1269,8 @@ fn configure_memory_limit(
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum VmRetention {
+    /// Remove disks after every attempt.
+    None,
     /// Retain disks only for failures, refusals, and errors.
     #[default]
     Failures,
@@ -1277,8 +1279,12 @@ enum VmRetention {
 }
 
 impl VmRetention {
-    const fn retains_passes(self) -> bool {
-        matches!(self, Self::All)
+    const fn retains(self, passed: bool) -> bool {
+        match self {
+            Self::None => false,
+            Self::Failures => !passed,
+            Self::All => true,
+        }
     }
 }
 
@@ -1717,7 +1723,7 @@ struct VmAttemptHost<'a> {
     runtime_image: &'a Path,
     vmm: &'a Path,
     gvproxy: Option<&'a Path>,
-    retain_passed_rootfs: bool,
+    retention: VmRetention,
     web_search: bool,
 }
 
@@ -2024,7 +2030,7 @@ struct VmVerifier {
     separate_launch: Option<VmLaunch>,
     cache: Option<VerifierCache>,
     attempt_cache: Option<AttemptVerifierCache>,
-    retain_passed_rootfs: bool,
+    retention: VmRetention,
     _network: Option<Gvproxy>,
 }
 
@@ -2155,7 +2161,7 @@ fn vm_attempt_inner(
             separate_launch,
             cache: verifier_cache,
             attempt_cache,
-            retain_passed_rootfs: host.retain_passed_rootfs,
+            retention: host.retention,
             _network: network,
         },
     })
@@ -2839,8 +2845,8 @@ impl VmVerifier {
         let reward = String::from_utf8_lossy(&reward_bytes)
             .trim()
             .parse::<f64>()?;
-        if reward > 0.0 && !self.retain_passed_rootfs {
-            self.remove_passed_root_disks();
+        if !self.retention.retains(reward > 0.0) {
+            self.remove_root_disks();
         }
         Ok(AttemptVerification {
             result: VerifierResult {
@@ -2930,23 +2936,23 @@ impl VmVerifier {
         }
     }
 
-    fn remove_passed_root_disks(&self) {
+    fn remove_root_disks(&self) {
         for launch in std::iter::once(&self.launch).chain(self.separate_launch.as_ref()) {
             if !launch.ext4 {
                 continue;
             }
-            match remove_passed_rootfs(&launch.root) {
+            match remove_attempt_rootfs(&launch.root) {
                 Ok(true) => info!(
                     target: "nanoeval",
                     vm_rootfs_path = %launch.root.display(),
-                    "removed passed attempt VM root disk"
+                    "removed attempt VM root disk"
                 ),
                 Ok(false) => {}
                 Err(error) => warn!(
                     target: "nanoeval",
                     vm_rootfs_path = %launch.root.display(),
                     %error,
-                    "failed to remove passed attempt VM root disk"
+                    "failed to remove attempt VM root disk"
                 ),
             }
         }
@@ -3098,6 +3104,9 @@ impl VmVerifier {
 impl Drop for VmVerifier {
     fn drop(&mut self) {
         self.remove_attempt_cache();
+        if self.retention == VmRetention::None {
+            self.remove_root_disks();
+        }
     }
 }
 
@@ -3157,7 +3166,7 @@ async fn mount_verifier_cache(session: &VmToolSession) -> Result<(), VmAttemptEr
     Ok(())
 }
 
-fn remove_passed_rootfs(rootfs: &Path) -> io::Result<bool> {
+fn remove_attempt_rootfs(rootfs: &Path) -> io::Result<bool> {
     if !rootfs.is_file() {
         return Ok(false);
     }
@@ -3493,7 +3502,7 @@ mod tests {
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, Eval,
         HostResources, RunInvocation, TURBO_PROMPT_HINT, VM_GUEST_TARGET, VmRetention,
         cached_verifier_script, configure_task_prompts, load_tasks, load_vm_guest_runtime_record,
-        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
+        recognized_verifier_setup, remove_attempt_rootfs, retained_retry_task_names,
         retained_task_durations, stage_vm_guest_runtime, verifier_bootstrap_network_failed,
         verifier_cache_key, verifier_network_retry_delay, verifier_shell,
     };
@@ -3531,7 +3540,7 @@ mod tests {
         assert_eq!(cli.eval.max_memory_mb, Some(24_576));
         assert_eq!(cli.eval.host_utilization, DEFAULT_HOST_UTILIZATION_PERCENT);
         assert!(cli.eval.vm);
-        assert!(!cli.eval.vm_retention.unwrap_or_default().retains_passes());
+        assert!(!cli.eval.vm_retention.unwrap_or_default().retains(true));
         assert!(cli.eval.suites.is_empty());
     }
 
@@ -3666,7 +3675,22 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(cli.eval.vm_retention.unwrap().retains_passes());
+        assert!(cli.eval.vm_retention.unwrap().retains(true));
+    }
+
+    #[test]
+    fn none_vm_retention_discards_failed_disks() {
+        let cli = TestCli::try_parse_from([
+            "nanoeval",
+            "--task",
+            "tasks/first",
+            "--vm",
+            "--vm-retention",
+            "none",
+        ])
+        .unwrap();
+
+        assert!(!cli.eval.vm_retention.unwrap().retains(false));
     }
 
     #[test]
@@ -3711,9 +3735,9 @@ mod tests {
         let rootfs = directory.path().join("rootfs.ext4");
         fs::write(&rootfs, b"guest disk").unwrap();
 
-        assert!(remove_passed_rootfs(&rootfs).unwrap());
+        assert!(remove_attempt_rootfs(&rootfs).unwrap());
         assert!(!rootfs.exists());
-        assert!(!remove_passed_rootfs(directory.path()).unwrap());
+        assert!(!remove_attempt_rootfs(directory.path()).unwrap());
     }
 
     #[test]
