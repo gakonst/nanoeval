@@ -1969,6 +1969,7 @@ struct VerifierCache {
     status: &'static str,
     cacheable_start: usize,
     cacheable_end: usize,
+    skip_setup: bool,
     disk_bytes: u64,
 }
 
@@ -2282,6 +2283,7 @@ impl VerifierCache {
             status,
             cacheable_start: setup.cacheable_start,
             cacheable_end: setup.cacheable_end,
+            skip_setup: setup.skip_setup,
             disk_bytes,
         }))
     }
@@ -2299,7 +2301,7 @@ impl VerifierCache {
         }
         Ok(AttemptVerifierCache {
             disk,
-            skip_setup: hit,
+            skip_setup: hit && self.skip_setup,
         })
     }
 
@@ -2520,6 +2522,7 @@ fn verifier_cache_populated(disk: &Path) -> io::Result<bool> {
 struct RecognizedVerifierSetup {
     cacheable_start: usize,
     cacheable_end: usize,
+    skip_setup: bool,
 }
 
 fn recognized_verifier_setup(script: &[u8]) -> Option<RecognizedVerifierSetup> {
@@ -2531,14 +2534,16 @@ fn recognized_verifier_setup(script: &[u8]) -> Option<RecognizedVerifierSetup> {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>();
-    if commands
-        != [
-            "apt-get update",
-            "apt-get install -y curl",
-            "curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh",
-            "source $HOME/.local/bin/env",
-        ]
-    {
+    let canonical = [
+        "apt-get update",
+        "apt-get install -y curl",
+        "curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh",
+        "source $HOME/.local/bin/env",
+    ];
+    let has_pinned_uv_bootstrap = commands
+        .windows(2)
+        .any(|commands| commands == &canonical[2..]);
+    if !has_pinned_uv_bootstrap {
         return None;
     }
     let cacheable_start = script
@@ -2548,6 +2553,7 @@ fn recognized_verifier_setup(script: &[u8]) -> Option<RecognizedVerifierSetup> {
     Some(RecognizedVerifierSetup {
         cacheable_start,
         cacheable_end: marker,
+        skip_setup: commands == canonical,
     })
 }
 
@@ -2565,13 +2571,17 @@ fn verifier_bootstrap_network_failed(output: &VmCommandOutput) -> bool {
     let contains = |needle: &str| stdout.contains(needle) || stderr.contains(needle);
     let dependency_runner_missing = contains("uvx: command not found")
         || contains("/root/.local/bin/env: No such file or directory");
-    let network_failed = contains("Temporary failure resolving")
-        || contains("Could not resolve host")
+    let dns_failed = contains("Temporary failure resolving") || contains("Could not resolve host");
+    let network_failed = dns_failed
         || contains("failed to download https://github.com/astral-sh/uv/")
         || contains("The requested URL returned error: 502")
         || contains("The requested URL returned error: 503")
         || contains("The requested URL returned error: 504");
-    dependency_runner_missing && network_failed
+    let apt_bootstrap_failed = dns_failed
+        && (contains("deb.debian.org")
+            || contains("archive.ubuntu.com")
+            || contains("security.ubuntu.com"));
+    apt_bootstrap_failed || dependency_runner_missing && network_failed
 }
 
 impl AttemptVerifier for VmVerifier {
@@ -2934,6 +2944,7 @@ impl VmVerifier {
             RecognizedVerifierSetup {
                 cacheable_start: cache.cacheable_start,
                 cacheable_end: cache.cacheable_end,
+                skip_setup: cache.skip_setup,
             },
         );
         session
@@ -3866,6 +3877,7 @@ source $HOME/.local/bin/env
 uvx pytest
 ";
         let setup = recognized_verifier_setup(supported).unwrap();
+        assert!(setup.skip_setup);
         assert_eq!(&supported[..setup.cacheable_start], b"#!/bin/bash\n");
         let omitted = &supported[setup.cacheable_start..setup.cacheable_end];
         assert!(omitted.windows(7).any(|window| window == b"apt-get"));
@@ -3892,19 +3904,30 @@ source $HOME/.local/bin/env
             )
             .is_none()
         );
-        assert!(
-            recognized_verifier_setup(
-                br"#!/bin/bash
+        let custom_setup = recognized_verifier_setup(
+            br"#!/bin/bash
+apt-get update
+apt-get install -y curl git libgl1
+curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
+source $HOME/.local/bin/env
+# Check if we're in a valid working directory
+",
+        )
+        .unwrap();
+        assert!(!custom_setup.skip_setup);
+
+        let stateful_setup = recognized_verifier_setup(
+            br"#!/bin/bash
 apt-get update
 apt-get install -y curl
 touch /root/extra-state
 curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
 source $HOME/.local/bin/env
 # Check if we're in a valid working directory
-"
-            )
-            .is_none()
-        );
+",
+        )
+        .unwrap();
+        assert!(!stateful_setup.skip_setup);
 
         let key = verifier_cache_key(
             std::ffi::OsStr::new("rootfs.ext4"),
@@ -3950,6 +3973,13 @@ source $HOME/.local/bin/env
             stderr: Vec::new(),
         };
         assert!(verifier_bootstrap_network_failed(&gateway_failure));
+
+        let apt_dns_failure = VmCommandOutput {
+            exit_code: 100,
+            stdout: Vec::new(),
+            stderr: b"Temporary failure resolving 'deb.debian.org'\n".to_vec(),
+        };
+        assert!(verifier_bootstrap_network_failed(&apt_dns_failure));
 
         let genuine_test_failure = VmCommandOutput {
             exit_code: 0,
