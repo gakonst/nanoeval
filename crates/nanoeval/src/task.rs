@@ -227,6 +227,16 @@ impl Task {
         &self.prompt
     }
 
+    /// Appends agent-owned context without changing the immutable task source.
+    #[must_use]
+    pub fn with_prompt_suffix(mut self, suffix: &str) -> Self {
+        let suffix = suffix.trim();
+        if !suffix.is_empty() {
+            self.prompt = format!("{}\n\n{suffix}", self.prompt.trim_end()).into_boxed_str();
+        }
+        self
+    }
+
     /// Files copied into the disposable native workspace before an attempt.
     #[must_use]
     pub fn environment_directory(&self) -> PathBuf {
@@ -572,6 +582,11 @@ MODE = "test"
         assert_eq!(task.environment()["MODE"], "test");
         assert_eq!(task.verifier().environment()["ANSWER"], "42");
         assert!(task.requires_compose());
+        assert_eq!(
+            task.with_prompt_suffix("  Use optional tools when useful.  ")
+                .prompt(),
+            "Fix the task.\n\nUse optional tools when useful."
+        );
     }
 
     #[test]

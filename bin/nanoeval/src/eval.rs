@@ -45,6 +45,12 @@ use crate::vm_image::{CachePolicy, PreparedRootDisk, VmImageBuilder};
 use crate::vm_network::{Gvproxy, GvproxyError, prepare_gvproxy};
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
+const TURBO_PROMPT_HINT: &str = r#"<nanocodex_turbo enabled="true">
+Recursive task tools are available inside Code Mode. When independent exploration, verification,
+or a fresh approach would materially help, use task or task_batch with focused instructions and
+strict output schemas, then reduce the returned evidence before acting. Continue directly when
+delegation would not help.
+</nanocodex_turbo>"#;
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
 const INVOCATION_VERSION: u32 = 1;
@@ -509,6 +515,7 @@ impl Eval {
         let observability = observability_started.elapsed();
         let (tasks, task_loading) =
             load_prioritized_tasks(resolved.task_paths.clone(), &resolved.output)?;
+        let tasks = configure_task_prompts(tasks, resolved.turbo);
         let (vmm, runtime_image, vm_runtime) =
             prepare_run_vm(resolved.vm, resolved.vm_rootfs.as_deref()).await?;
         let gvproxy =
@@ -655,6 +662,17 @@ impl Eval {
 async fn shutdown_task_runtime(runtime: Option<&TaskRuntime>) {
     if let Some(runtime) = runtime {
         runtime.shutdown().await;
+    }
+}
+
+fn configure_task_prompts(tasks: Vec<Task>, turbo: bool) -> Vec<Task> {
+    if turbo {
+        tasks
+            .into_iter()
+            .map(|task| task.with_prompt_suffix(TURBO_PROMPT_HINT))
+            .collect()
+    } else {
+        tasks
     }
 }
 
@@ -3473,11 +3491,11 @@ mod tests {
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, Eval,
-        HostResources, RunInvocation, VM_GUEST_TARGET, VmRetention, cached_verifier_script,
-        load_tasks, load_vm_guest_runtime_record, recognized_verifier_setup, remove_passed_rootfs,
-        retained_retry_task_names, retained_task_durations, stage_vm_guest_runtime,
-        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
-        verifier_shell,
+        HostResources, RunInvocation, TURBO_PROMPT_HINT, VM_GUEST_TARGET, VmRetention,
+        cached_verifier_script, configure_task_prompts, load_tasks, load_vm_guest_runtime_record,
+        recognized_verifier_setup, remove_passed_rootfs, retained_retry_task_names,
+        retained_task_durations, stage_vm_guest_runtime, verifier_bootstrap_network_failed,
+        verifier_cache_key, verifier_network_retry_delay, verifier_shell,
     };
 
     #[derive(Parser)]
@@ -3547,6 +3565,18 @@ mod tests {
 
         assert!(resolved.turbo);
         assert!(resolved.invocation().turbo);
+    }
+
+    #[test]
+    fn turbo_adds_recursive_tool_guidance_to_the_agent_prompt() {
+        let suite = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks");
+        let tasks = load_tasks(Vec::new(), vec![suite]).unwrap();
+        let original_prompt = tasks[0].prompt().to_owned();
+
+        let configured = configure_task_prompts(tasks, true);
+
+        assert!(configured[0].prompt().starts_with(&original_prompt));
+        assert!(configured[0].prompt().ends_with(TURBO_PROMPT_HINT));
     }
 
     #[test]
