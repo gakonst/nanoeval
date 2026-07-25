@@ -50,7 +50,7 @@ impl VmCommand {
             arguments: Vec::new(),
             current_directory: "/".to_owned(),
             environment: Vec::new(),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
         }
     }
 
@@ -763,7 +763,7 @@ async fn read_to_end(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<
 #[cfg(test)]
 mod tracing_tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -777,8 +777,13 @@ mod tracing_tests {
 
     use super::VmToolSession;
 
+    static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[derive(Clone, Default)]
-    struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
+    struct TraceCapture {
+        spans: Arc<Mutex<HashMap<u64, CapturedSpan>>>,
+        names: Arc<Mutex<HashSet<&'static str>>>,
+    }
 
     struct CapturedSpan {
         name: &'static str,
@@ -814,7 +819,11 @@ mod tracing_tests {
                 });
             let mut fields = HashMap::new();
             attributes.record(&mut FieldCapture(&mut fields));
-            self.0.lock().unwrap().insert(
+            self.names
+                .lock()
+                .unwrap()
+                .insert(attributes.metadata().name());
+            self.spans.lock().unwrap().insert(
                 id.clone().into_u64(),
                 CapturedSpan {
                     name: attributes.metadata().name(),
@@ -830,7 +839,7 @@ mod tracing_tests {
             values: &tracing::span::Record<'_>,
             _context: LayerContext<'_, S>,
         ) {
-            if let Some(span) = self.0.lock().unwrap().get_mut(&id.clone().into_u64()) {
+            if let Some(span) = self.spans.lock().unwrap().get_mut(&id.clone().into_u64()) {
                 values.record(&mut FieldCapture(&mut span.fields));
             }
         }
@@ -838,6 +847,7 @@ mod tracing_tests {
 
     #[test]
     fn vm_rpc_is_timed_and_parented_to_the_calling_tool() {
+        let _trace_test_guard = TRACE_TEST_LOCK.lock().unwrap();
         let response = r#"{"kind":"tool","payload":{"id":0,"execution":{"output":"ok","success":true,"code_mode_value":null,"metadata":null,"process_trace":null},"error":null}}"#;
         let script = format!("IFS= read -r request\nprintf '%s\\n' '{response}'");
         let mut command = tokio::process::Command::new("/bin/sh");
@@ -850,6 +860,7 @@ mod tracing_tests {
             .unwrap();
 
         tracing::dispatcher::with_default(&dispatch, || {
+            tracing::callsite::rebuild_interest_cache();
             runtime.block_on(async {
                 let session = VmToolSession::spawn(&mut command).unwrap();
                 let context = ToolContext {
@@ -872,7 +883,7 @@ mod tracing_tests {
             });
         });
 
-        let spans = capture.0.lock().unwrap();
+        let spans = capture.spans.lock().unwrap();
         let (tool_id, _) = spans
             .iter()
             .find(|(_, span)| span.name == "test.tool.execute")
@@ -892,11 +903,12 @@ mod tracing_tests {
         );
         assert!(rpc.fields.contains_key("rpc.queue.duration_ns"));
         assert!(rpc.fields.contains_key("duration_ns"));
-        assert!(spans.values().any(|span| span.name == "vm.session.spawn"));
+        assert!(capture.names.lock().unwrap().contains("vm.session.spawn"));
     }
 
     #[test]
     fn next_request_discards_a_cancelled_requests_late_response() {
+        let _trace_test_guard = TRACE_TEST_LOCK.lock().unwrap();
         let first = r#"{"kind":"write_file","payload":{"id":0,"error":null}}"#;
         let second = r#"{"kind":"write_file","payload":{"id":1,"error":null}}"#;
         let script = format!(
