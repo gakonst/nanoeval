@@ -21,7 +21,8 @@ use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use eyre::{Result, eyre};
 use fs2::FileExt as _;
-use nanocodex::{Thinking, Tools, ToolsBuildError, UpdatePlanTool};
+use nanocodex::{NanocodexBuilder, Thinking, Tools, ToolsBuildError, UpdatePlanTool};
+use nanocodex_rlm::{TaskRuntime, TaskTools};
 use nanocodex_vm::{VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmTools};
 use nanoeval::{
     AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEventKind, EvalFailure,
@@ -180,6 +181,7 @@ struct ResolvedRun {
     vm_retention: VmRetention,
     thinking: Thinking,
     web_search: bool,
+    turbo: bool,
     rerun_from: Option<PathBuf>,
     automatic_scheduling: Option<AutomaticScheduling>,
 }
@@ -235,6 +237,8 @@ struct RunInvocation {
     thinking: String,
     #[serde(default)]
     web_search: bool,
+    #[serde(default)]
+    turbo: bool,
     rerun_from: Option<PathBuf>,
 }
 
@@ -247,6 +251,7 @@ impl RunInvocation {
             && self.vm_retention == other.vm_retention
             && self.thinking == other.thinking
             && self.web_search == other.web_search
+            && self.turbo == other.turbo
             && self.rerun_from == other.rerun_from
     }
 }
@@ -442,6 +447,10 @@ impl Eval {
                     .map(|invocation| invocation.web_search)
             })
             .unwrap_or(false);
+        let turbo = self.agent.turbo()
+            || retained_invocation
+                .as_ref()
+                .is_some_and(|invocation| invocation.turbo);
         let vm_rootfs = self.vm_rootfs.clone().or_else(|| {
             retained_invocation
                 .as_ref()
@@ -473,6 +482,7 @@ impl Eval {
                 .unwrap_or_default(),
             thinking,
             web_search,
+            turbo,
             rerun_from: rerun.map(|rerun| rerun.job),
             automatic_scheduling: scheduling.automatic,
         })
@@ -515,11 +525,12 @@ impl Eval {
         .await?;
         let vm_environments_duration = vm_environments_started.elapsed();
         let evaluation_setup_started = Instant::now();
-        let nanocodex = self.agent.builder(resolved.thinking, resolved.web_search)?;
+        let (task_runtime, task_tools, nanocodex, agent_id) =
+            configure_task_arm(self.agent, &resolved)?;
         let sweep = Sweep::builder()
             .tasks(tasks)
             .trials(resolved.trials)
-            .agent("default", nanocodex.clone())?
+            .agent(agent_id, nanocodex.clone())?
             .build()?;
         let attempt_count = sweep.attempt_count();
         let evaluator = Nanoeval::builder(nanocodex)
@@ -528,6 +539,7 @@ impl Eval {
         let evaluator = configure_memory_limit(evaluator, resolved.max_memory_mb);
         let mut evaluator = bind_finite_run(evaluator, &sweep, self.lifecycle.new_job);
         if let Some(environments) = vm_environments {
+            let task_tools = task_tools.clone();
             evaluator = evaluator.attempt_agent(move |attempt, builder| {
                 let environment = environments.get(attempt.task().root()).ok_or_else(|| {
                     VmAttemptError::MissingPreparedEnvironment(attempt.task().root().to_path_buf())
@@ -543,9 +555,7 @@ impl Eval {
                     },
                     attempt,
                 )?;
-                Ok::<_, VmAttemptError>(
-                    AttemptAgent::new(builder.tools(runtime.tools)).verifier(runtime.verifier),
-                )
+                Ok::<_, VmAttemptError>(configure_vm_attempt(builder, runtime, task_tools.clone()))
             });
         }
         let (eval, events) = evaluator.build()?;
@@ -564,16 +574,15 @@ impl Eval {
         let attempts_started = Instant::now();
         let sweep_result = eval.sweep(sweep).await;
         let attempts = attempts_started.elapsed();
-        let finished =
-            finish_evaluation(harbor, remaining_attempts, progress, sweep_result).await?;
-        let output_started = Instant::now();
-        Self::write_report(
+        let finished = finish_evaluation(harbor, remaining_attempts, progress, sweep_result).await;
+        shutdown_task_runtime(task_runtime.as_ref()).await;
+        let finished = finished?;
+        let output = Self::finish_output(
             &finished.job,
             finished.outcomes,
             skipped_attempts,
             self.json,
         )?;
-        let output = output_started.elapsed();
         RunMeasurements {
             observability,
             task_loading,
@@ -586,8 +595,19 @@ impl Eval {
             total: total_started.elapsed(),
         }
         .record(&finished.results, attempt_count, finished.failed);
-        record_last_run(finished.job.directory())?;
         finish_run(finished.run_error)
+    }
+
+    fn finish_output(
+        job: &HarborJob,
+        outcomes: Vec<AttemptOutcome>,
+        skipped: usize,
+        json: bool,
+    ) -> Result<Duration> {
+        let started_at = Instant::now();
+        Self::write_report(job, outcomes, skipped, json)?;
+        record_last_run(job.directory())?;
+        Ok(started_at.elapsed())
     }
 
     fn write_report(
@@ -632,12 +652,53 @@ impl Eval {
     }
 }
 
+async fn shutdown_task_runtime(runtime: Option<&TaskRuntime>) {
+    if let Some(runtime) = runtime {
+        runtime.shutdown().await;
+    }
+}
+
+fn configure_task_arm(
+    agent: AgentArgs,
+    resolved: &ResolvedRun,
+) -> Result<(
+    Option<TaskRuntime>,
+    Option<TaskTools>,
+    NanocodexBuilder,
+    String,
+)> {
+    let runtime = resolved.turbo.then(TaskRuntime::new);
+    let tools = runtime.as_ref().map(TaskRuntime::tools);
+    let builder = agent.builder(resolved.thinking, resolved.web_search, tools.clone())?;
+    let id = if resolved.turbo {
+        format!("{}-turbo", resolved.thinking)
+    } else {
+        "default".to_owned()
+    };
+    Ok((runtime, tools, builder, id))
+}
+
+fn configure_vm_attempt(
+    builder: NanocodexBuilder,
+    runtime: VmAttempt,
+    task_tools: Option<TaskTools>,
+) -> AttemptAgent {
+    let VmAttempt { tools, verifier } = runtime;
+    let builder = match task_tools {
+        Some(task_tools) => {
+            builder.tools_factory(move |agent| task_tools.install(tools.clone(), agent))
+        }
+        None => builder.tools(tools),
+    };
+    AttemptAgent::new(builder).verifier(verifier)
+}
+
 impl ResolvedRun {
     fn report_configuration(&self) {
         let environment = if self.vm { "microVM" } else { "host" };
         eprintln!(
-            "Eval config: thinking={} · trials={} · concurrency={} · environment={environment} · web_search={}",
-            self.thinking, self.trials, self.concurrency, self.web_search
+            "Eval config: thinking={} · trials={} · concurrency={} · environment={environment} · web_search={} · turbo={}",
+            self.thinking, self.trials, self.concurrency, self.web_search, self.turbo
         );
     }
 
@@ -680,6 +741,7 @@ impl ResolvedRun {
             vm_retention: self.vm_retention,
             thinking: self.thinking.to_string(),
             web_search: self.web_search,
+            turbo: self.turbo,
             rerun_from: self.rerun_from.clone(),
         }
     }
@@ -3477,6 +3539,17 @@ mod tests {
     }
 
     #[test]
+    fn turbo_is_an_explicit_retained_eval_arm() {
+        let cli =
+            TestCli::try_parse_from(["nanoeval", "--task", "tasks/first", "--turbo"]).unwrap();
+
+        let resolved = cli.eval.resolve_run().unwrap();
+
+        assert!(resolved.turbo);
+        assert!(resolved.invocation().turbo);
+    }
+
+    #[test]
     fn host_defaults_use_the_configured_share_of_cpu_and_memory() {
         let host = HostResources {
             logical_cpus: 10,
@@ -3534,6 +3607,7 @@ mod tests {
             vm_retention: VmRetention::Failures,
             thinking: "xhigh".to_owned(),
             web_search: false,
+            turbo: false,
             rerun_from: None,
         };
         let mut resumed = retained.clone();
@@ -3544,6 +3618,10 @@ mod tests {
 
         resumed.thinking = "high".to_owned();
         assert!(!retained.same_workload(&resumed));
+
+        let mut turbo = retained.clone();
+        turbo.turbo = true;
+        assert!(!retained.same_workload(&turbo));
     }
 
     #[test]
@@ -3791,6 +3869,7 @@ mod tests {
                 vm_retention: super::VmRetention::Failures,
                 thinking: "low".to_owned(),
                 web_search: false,
+                turbo: false,
                 rerun_from: Some(base.canonicalize().unwrap()),
             },
         )

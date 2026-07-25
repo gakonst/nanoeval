@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
 use nanocodex::{Nanocodex, NanocodexBuilder, OpenAiAuth, Thinking, Tools};
+use nanocodex_rlm::TaskTools;
 
 #[derive(Args)]
 pub(crate) struct AgentArgs {
@@ -21,13 +22,28 @@ pub(crate) struct AgentArgs {
     /// Allow the agent to search the public web. Disabled by default for eval integrity.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     web_search: Option<bool>,
+
+    /// Enable recursive schema-constrained task tools for the experimental turbo arm.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    turbo: bool,
 }
 
 impl AgentArgs {
-    pub(crate) fn builder(self, thinking: Thinking, web_search: bool) -> Result<NanocodexBuilder> {
+    pub(crate) fn builder(
+        self,
+        thinking: Thinking,
+        web_search: bool,
+        task_tools: Option<TaskTools>,
+    ) -> Result<NanocodexBuilder> {
         let auth = Self::select_auth(self.api_key, self.auth_file, Self::environment_api_key()?)?;
         let tools = Tools::builder().web_search(web_search).build()?;
-        Ok(Nanocodex::builder(auth).thinking(thinking).tools(tools))
+        let builder = Nanocodex::builder(auth).thinking(thinking);
+        Ok(match task_tools {
+            Some(task_tools) => {
+                builder.tools_factory(move |agent| task_tools.install(tools.clone(), agent))
+            }
+            None => builder.tools(tools),
+        })
     }
 
     pub(crate) const fn thinking(&self) -> Option<Thinking> {
@@ -36,6 +52,10 @@ impl AgentArgs {
 
     pub(crate) const fn web_search(&self) -> Option<bool> {
         self.web_search
+    }
+
+    pub(crate) const fn turbo(&self) -> bool {
+        self.turbo
     }
 
     fn select_auth(

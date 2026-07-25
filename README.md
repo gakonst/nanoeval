@@ -374,6 +374,13 @@ policy is separate from a task's declared guest network policy. Terminal-Bench
 2.1's legacy `allow_internet` maps to Harbor's `public` and `no-network` modes;
 Nanoeval honors it when launching the VM.
 
+`--turbo` is a separate retained experimental arm. It installs Nanocodex's
+schema-constrained `task`, `task_batch`, `task_continue`, and `submit_result`
+tools for every root and clean child agent. With `--vm`, recursive children
+reuse the attempt's VM-backed workspace tools; they do not escape into host
+tools. Turbo attempts receive an explicit `<thinking>-turbo` sweep identity so
+their retained trials cannot be mistaken for the ordinary control arm.
+
 Every `--task` is one eval and the CLI defaults to `k=5`: five fresh independent
 attempts per task. Run the complete three-eval suite with:
 

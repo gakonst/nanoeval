@@ -21,6 +21,7 @@ fs2.workspace = true
 ignore.workspace = true
 nanocodex.workspace = true
 nanocodex-observability.workspace = true
+nanocodex-rlm.workspace = true
 nanocodex-vm.workspace = true
 nanoeval.workspace = true
 nanoeval-harbor.workspace = true
