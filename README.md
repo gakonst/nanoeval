@@ -150,6 +150,46 @@ guest lifetime. Guest loopback and listening ports remain private per attempt,
 so concurrent tasks may both bind `localhost:8080` without reaching each other
 or a host service.
 
+The same primitives support an invisible headed-browser worker without a
+Docker runtime. Prepare the Chromium root disk once from the repository task:
+
+```sh
+cargo run -- vm prepare --task tasks/browser-runtime
+```
+
+`nanovm-browser::BrowserVmBuilder` reflinks that immutable ext4 template,
+starts Chromium as an unprivileged guest user under Xvfb, gives the VM its own
+gvproxy network stack, and exposes CDP only through a randomly selected host
+loopback port. The browser is headed inside the guest but no window exists in
+the macOS desktop session. Dropping or explicitly shutting down the handle
+terminates the VMM, gvproxy, and disposable disk.
+
+```rust,ignore
+let browser_vm = BrowserVmBuilder::new(root_disk, signed_vmm, gvproxy)
+    .firmware_directory(libkrun_firmware)
+    .cpus(2)
+    .memory_mib(2_048)
+    .spawn()
+    .await?;
+
+let cdp_endpoint = browser_vm.cdp_endpoint().clone();
+// Pass `cdp_endpoint` to the Nanocodex browser-tool builder.
+```
+
+OCI/Dockerfile materialization is preprocessing only. Once the root disk is
+cached, ordinary harness and browser-tool iterations directly reflink and boot
+it; neither Docker nor a task-image build is on the run path. The
+`browser-vm` example prints the private WebSocket endpoint and keeps the VM
+alive until Enter:
+
+```sh
+cargo run -p nanoeval-examples --bin browser-vm -- \
+  --root-disk /path/to/browser.ext4 \
+  --vmm /path/to/signed/nanoeval \
+  --gvproxy /path/to/gvproxy \
+  --firmware-directory /path/to/libkrunfw
+```
+
 Prepare one or more Terminal-Bench 2.1 environments without running agents:
 
 ```sh
@@ -1091,6 +1131,7 @@ The repository follows the same library-first split as Nanocodex:
 | `nanoeval` | Tasks, attempts, verification, scheduling, native job state, and typed event subscriptions |
 | `nanoeval-harbor` | Streaming Harbor job/trial persistence and ATIF projection |
 | `nanovm` | libkrun configuration, host capabilities, guest commands, and the low-level VMM lifecycle |
+| `nanovm-browser` | Disposable headed Chromium microVMs and private loopback CDP forwarding |
 | `nanoeval-bin` | Thin CLI over the libraries |
 | `nanoeval-examples` | Compiling public API consumers |
 

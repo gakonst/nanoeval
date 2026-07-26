@@ -6,11 +6,13 @@
 mod capabilities;
 mod command;
 mod config;
+mod gvproxy;
 mod krun;
 
 pub use capabilities::{Capabilities, KrunFeature};
 pub use command::GuestCommand;
 pub use config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig};
+pub use gvproxy::{Gvproxy, GvproxyError};
 pub use krun::{KrunVm, KrunVmControl, VmError};
 
 /// The complete upstream libkrun API pinned by this workspace's lockfile.

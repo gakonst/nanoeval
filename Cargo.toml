@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanoeval", "crates/nanocodex-vm", "crates/nanoeval", "crates/nanoeval-harbor", "crates/nanovm", "examples"]
+members = ["bin/nanoeval", "crates/nanocodex-vm", "crates/nanoeval", "crates/nanoeval-harbor", "crates/nanovm", "crates/nanovm-browser", "examples"]
 default-members = ["bin/nanoeval"]
 resolver = "2"
 
@@ -34,6 +34,7 @@ nanocodex-vm = { version = "0.1.0", path = "crates/nanocodex-vm" }
 nanoeval = { version = "0.1.0", path = "crates/nanoeval" }
 nanoeval-harbor = { version = "0.1.0", path = "crates/nanoeval-harbor" }
 nanovm = { version = "0.1.0", path = "crates/nanovm" }
+nanovm-browser = { version = "0.1.0", path = "crates/nanovm-browser" }
 nix = { version = "0.30", features = ["signal"] }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 reflink-copy = "0.1.30"

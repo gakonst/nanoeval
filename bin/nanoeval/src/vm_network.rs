@@ -2,18 +2,15 @@ use std::{
     env, fs, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Child, Stdio},
-    thread,
-    time::{Duration, Instant},
 };
 
+use nanovm::Gvproxy as GvproxyProcess;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use thiserror::Error;
 use tokio::process::Command;
 
 const GVPROXY_VERSION: &str = "v0.8.9";
-const GVPROXY_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub(crate) enum GvproxyError {
@@ -35,11 +32,8 @@ pub(crate) enum GvproxyError {
         actual: String,
     },
 
-    #[error("gvproxy exited before creating its network socket: {0}")]
-    EarlyExit(std::process::ExitStatus),
-
-    #[error("gvproxy did not create {path} within {timeout:?}")]
-    SocketTimeout { path: PathBuf, timeout: Duration },
+    #[error(transparent)]
+    Process(#[from] nanovm::GvproxyError),
 
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -47,61 +41,24 @@ pub(crate) enum GvproxyError {
 
 /// One userspace network stack dedicated to one VM attempt.
 pub(crate) struct Gvproxy {
-    child: Child,
+    process: GvproxyProcess,
     _directory: TempDir,
-    socket: PathBuf,
 }
 
 impl Gvproxy {
     pub(crate) fn spawn(binary: &Path, log: &Path) -> Result<Self, GvproxyError> {
-        if let Some(parent) = log.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let directory = tempfile::Builder::new()
             .prefix("nanoeval-gvproxy-")
             .tempdir()?;
-        let socket = directory.path().join("network.sock");
-        let log = fs::File::create(log)?;
-        let mut child = std::process::Command::new(binary)
-            .arg("--listen-vfkit")
-            .arg(format!("unixgram:{}", socket.display()))
-            .arg("--ssh-port")
-            .arg("-1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()?;
-        let started_at = Instant::now();
-        while !socket.exists() {
-            if let Some(status) = child.try_wait()? {
-                return Err(GvproxyError::EarlyExit(status));
-            }
-            if started_at.elapsed() >= GVPROXY_SOCKET_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GvproxyError::SocketTimeout {
-                    path: socket,
-                    timeout: GVPROXY_SOCKET_TIMEOUT,
-                });
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        let process = GvproxyProcess::spawn(binary, directory.path(), log)?;
         Ok(Self {
-            child,
+            process,
             _directory: directory,
-            socket,
         })
     }
 
     pub(crate) fn socket(&self) -> &Path {
-        &self.socket
-    }
-}
-
-impl Drop for Gvproxy {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.process.network_socket()
     }
 }
 
