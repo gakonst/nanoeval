@@ -46,10 +46,29 @@ use crate::vm_network::{Gvproxy, GvproxyError, prepare_gvproxy};
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
 const TURBO_PROMPT_HINT: &str = r#"<nanocodex_turbo enabled="true">
-Recursive task tools are available inside Code Mode. When independent exploration, verification,
-or a fresh approach would materially help, use task or task_batch with focused instructions and
-strict output schemas, then reduce the returned evidence before acting. Continue directly when
-delegation would not help.
+Recursive structured task tools are available. Before constructing or writing the final candidate,
+start a clean child with only original requirements and source workspace evidence. Require it to
+return a complete executable checker program, not a prose verification plan. The checker must read
+the raw candidate artifact from stdin, inspect authoritative source evidence itself, run required
+external ground-truth commands, and emit a structured verdict. Have the child derive candidate-
+independent invariants from the requirements and evidence. For every parsed boundary or derived
+measurement, enumerate the nearest plausible interpretations instead of silently choosing one.
+Create adversarial fixture pairs that differ only in adjacent, overlapping, aliased, or excluded
+content and make those interpretations disagree. Expected self-test outcomes must come independently
+from the requirements, source evidence, or an external oracle rather than from the production check
+being tested. Every adversarial fixture must pass through the checker's real candidate-input
+entrypoint and assert both its verdict and relevant derived measurements; tests of disconnected
+helper logic do not count. When evidence cannot resolve an interpretation, retain all plausible
+interpretations and accept only candidates satisfying every one. After preflight, start a second
+clean child with the original requirements, source evidence, exact checker bytes, and test transcript.
+Have it black-box the checker with candidate-shaped mutations and return executable counterexamples
+for unsupported assumptions, untested boundaries, or false accepts. Repair through the original
+child and repeat preflight and audit until the critic finds no counterexample. Only then record the
+exact checker bytes, self-test and audit output, and content hash. After candidate construction begins,
+do not modify or reinterpret the checker. Execute those same bytes against the raw candidate and
+write the candidate only when that execution accepts it. Preserve exact checker stdout, stderr, exit
+status, and hash. Treat an undecidable or unaudited checker as a failed preflight rather than replacing
+its checks with parent reasoning.
 </nanocodex_turbo>"#;
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
