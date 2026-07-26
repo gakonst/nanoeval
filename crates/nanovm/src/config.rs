@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// Root filesystem exposed to one guest.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RootFilesystem {
     /// A host directory shared through virtiofs.
     Directory(PathBuf),
@@ -10,7 +12,7 @@ pub enum RootFilesystem {
 }
 
 /// Network access supplied to the guest by libkrun.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Network {
     /// Do not attach a virtio-vsock device or proxy guest internet sockets.
     Disabled,
@@ -38,7 +40,7 @@ impl Network {
 }
 
 /// One additional block device attached after the root disk.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlockDevice {
     id: String,
     path: PathBuf,
@@ -81,7 +83,7 @@ impl BlockDevice {
 }
 
 /// One narrowly scoped host directory exposed to the guest through virtiofs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SharedDirectory {
     tag: String,
     path: PathBuf,
@@ -124,7 +126,7 @@ impl SharedDirectory {
 }
 
 /// Immutable configuration for one libkrun VM.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VmConfig {
     root: RootFilesystem,
     cpus: u8,

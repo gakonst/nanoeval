@@ -1,5 +1,5 @@
 [package]
-name = "nanovm"
+name = "nanovm-browser"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,14 +11,18 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Small, embedded libkrun microVM primitives for Rust"
+description = "Headed Chromium runtime in an isolated libkrun microVM"
 
 [dependencies]
-krun.workspace = true
+nanovm.workspace = true
+reflink-copy.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

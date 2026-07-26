@@ -50,7 +50,7 @@ impl VmCommand {
             arguments: Vec::new(),
             current_directory: "/".to_owned(),
             environment: Vec::new(),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
         }
     }
 
@@ -778,7 +778,10 @@ mod tracing_tests {
     use super::VmToolSession;
 
     #[derive(Clone, Default)]
-    struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
+    struct TraceCapture {
+        spans: Arc<Mutex<HashMap<u64, CapturedSpan>>>,
+        names: Arc<Mutex<Vec<&'static str>>>,
+    }
 
     struct CapturedSpan {
         name: &'static str,
@@ -803,6 +806,10 @@ mod tracing_tests {
         S: Subscriber + for<'lookup> LookupSpan<'lookup>,
     {
         fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: LayerContext<'_, S>) {
+            self.names
+                .lock()
+                .unwrap()
+                .push(attributes.metadata().name());
             let parent = attributes
                 .parent()
                 .map(|parent| parent.clone().into_u64())
@@ -814,7 +821,7 @@ mod tracing_tests {
                 });
             let mut fields = HashMap::new();
             attributes.record(&mut FieldCapture(&mut fields));
-            self.0.lock().unwrap().insert(
+            self.spans.lock().unwrap().insert(
                 id.clone().into_u64(),
                 CapturedSpan {
                     name: attributes.metadata().name(),
@@ -830,7 +837,7 @@ mod tracing_tests {
             values: &tracing::span::Record<'_>,
             _context: LayerContext<'_, S>,
         ) {
-            if let Some(span) = self.0.lock().unwrap().get_mut(&id.clone().into_u64()) {
+            if let Some(span) = self.spans.lock().unwrap().get_mut(&id.clone().into_u64()) {
                 values.record(&mut FieldCapture(&mut span.fields));
             }
         }
@@ -872,7 +879,7 @@ mod tracing_tests {
             });
         });
 
-        let spans = capture.0.lock().unwrap();
+        let spans = capture.spans.lock().unwrap();
         let (tool_id, _) = spans
             .iter()
             .find(|(_, span)| span.name == "test.tool.execute")
@@ -892,7 +899,7 @@ mod tracing_tests {
         );
         assert!(rpc.fields.contains_key("rpc.queue.duration_ns"));
         assert!(rpc.fields.contains_key("duration_ns"));
-        assert!(spans.values().any(|span| span.name == "vm.session.spawn"));
+        assert!(capture.names.lock().unwrap().contains(&"vm.session.spawn"));
     }
 
     #[test]

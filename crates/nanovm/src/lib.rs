@@ -6,12 +6,18 @@
 mod capabilities;
 mod command;
 mod config;
+mod egress;
+mod gvproxy;
 mod krun;
+mod process;
 
 pub use capabilities::{Capabilities, KrunFeature};
 pub use command::GuestCommand;
 pub use config::{BlockDevice, Network, RootFilesystem, SharedDirectory, VmConfig};
+pub use egress::{EgressError, EgressLease, EgressMount};
+pub use gvproxy::{Gvproxy, GvproxyError};
 pub use krun::{KrunVm, KrunVmControl, VmError};
+pub use process::{PrivateVmProcessConfig, VmProcessConfig, VmProcessError};
 
 /// The complete upstream libkrun API pinned by this workspace's lockfile.
 ///

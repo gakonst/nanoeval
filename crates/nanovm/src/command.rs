@@ -1,14 +1,32 @@
-use std::{collections::BTreeMap, ffi::OsString, path::Path};
+use std::{collections::BTreeMap, ffi::OsString, fmt, path::Path};
+
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// A command to execute as the initial process inside a libkrun guest.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GuestCommand {
     program: OsString,
     arguments: Vec<OsString>,
+    #[serde(with = "environment_serde")]
     environment: BTreeMap<OsString, OsString>,
     current_dir: OsString,
+}
+
+impl fmt::Debug for GuestCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestCommand")
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field(
+                "environment_keys",
+                &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .field("current_dir", &self.current_dir)
+            .finish()
+    }
 }
 
 impl GuestCommand {
@@ -67,6 +85,31 @@ impl GuestCommand {
     #[must_use]
     pub fn current_directory(&self) -> &Path {
         Path::new(&self.current_dir)
+    }
+}
+
+mod environment_serde {
+    use std::{collections::BTreeMap, ffi::OsString};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(
+        environment: &BTreeMap<OsString, OsString>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        environment.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<OsString, OsString>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(OsString, OsString)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
     }
 }
 

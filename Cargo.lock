@@ -2156,11 +2156,13 @@ dependencies = [
 name = "nanoeval-examples"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "nanocodex",
  "nanocodex-vm",
  "nanoeval",
  "nanoeval-harbor",
  "nanovm",
+ "nanovm-browser",
  "serde",
  "serde_json",
  "tokio",
@@ -2191,7 +2193,25 @@ name = "nanovm"
 version = "0.1.0"
 dependencies = [
  "libkrun",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "nanovm-browser"
+version = "0.1.0"
+dependencies = [
+ "nanovm",
+ "reflink-copy",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
 ]
 
 [[package]]

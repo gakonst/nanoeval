@@ -19,7 +19,9 @@ use std::{
 use clap::{CommandFactory, Parser, Subcommand};
 use eyre::{Result, eyre};
 use nanoeval::{Task, VerifierCollect, VerifierEnvironmentMode};
-use nanovm::{BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig};
+use nanovm::{
+    BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig, VmProcessConfig,
+};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -147,6 +149,13 @@ enum VmCommand {
         #[arg(required = true, trailing_var_arg = true)]
         guest_command: Vec<std::ffi::OsString>,
     },
+
+    /// Enter a dedicated VMM process from a private serialized configuration.
+    #[command(hide = true)]
+    RunConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Clone)]
@@ -247,9 +256,18 @@ enum GuestEnvironmentParseError {
 }
 
 fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
+    if !is_vmm_process() {
+        let _ = dotenvy::dotenv();
+    }
     enable_paint();
     let cli = Cli::parse();
+
+    if let Some(Command::Vm {
+        command: VmCommand::RunConfig { config },
+    }) = &cli.command
+    {
+        return VmProcessConfig::read(config)?.run().map_err(Into::into);
+    }
 
     if let Some(Command::Vm {
         command:
@@ -289,6 +307,12 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?
         .block_on(run(cli))
+}
+
+fn is_vmm_process() -> bool {
+    let mut arguments = std::env::args_os().skip(1);
+    arguments.next().as_deref() == Some(std::ffi::OsStr::new("vm"))
+        && arguments.next().as_deref() == Some(std::ffi::OsStr::new("run-config"))
 }
 
 fn enable_paint() {
@@ -523,6 +547,11 @@ async fn run(cli: Cli) -> Result<()> {
                 environment: &environment,
                 guest_command: &guest_command,
             })?;
+        }
+        Command::Vm {
+            command: VmCommand::RunConfig { config },
+        } => {
+            VmProcessConfig::read(config)?.run()?;
         }
     }
     Ok(())
