@@ -46,10 +46,13 @@ use crate::vm_network::{Gvproxy, GvproxyError, prepare_gvproxy};
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
 const TURBO_PROMPT_HINT: &str = r#"<nanocodex_turbo enabled="true">
-Recursive task tools are available inside Code Mode. When independent exploration, verification,
-or a fresh approach would materially help, use task or task_batch with focused instructions and
-strict output schemas, then reduce the returned evidence before acting. Continue directly when
-delegation would not help.
+Work directly on the task first. Before finishing consequential workspace output, read every exact
+target file and call review with candidate.artifacts entries containing each path and its complete
+UTF-8 content; optional candidate.claims may describe runtime checks. The review tool already owns
+independent map/check/reduce and may repair concrete defects. Call it exactly once per user turn;
+after its validated resolution returns, do not review its repair again. Do not pre-delegate by
+default; use task or task_batch only if review returns blocked or a genuinely separate question
+remains.
 </nanocodex_turbo>"#;
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";

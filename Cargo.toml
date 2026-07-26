@@ -27,10 +27,10 @@ fs2 = "0.4"
 flate2 = "1.1"
 ignore = "0.4.31"
 krun = { package = "libkrun", git = "https://github.com/containers/libkrun", branch = "main", features = ["blk", "net"] }
-nanocodex = { version = "0.1.1", path = "../nanocodex/crates/nanocodex" }
-nanocodex-observability = { version = "0.1.1", path = "../nanocodex/crates/nanocodex-observability" }
-nanocodex-rlm = { version = "0.1.1", path = "../nanocodex/crates/nanocodex-rlm" }
-nanocodex-tools = { version = "0.1.1", path = "../nanocodex/crates/nanocodex-tools", default-features = false }
+nanocodex = { version = "0.1.1", path = "../nanocodex-rlm/crates/nanocodex" }
+nanocodex-observability = { version = "0.1.1", path = "../nanocodex-rlm/crates/nanocodex-observability" }
+nanocodex-rlm = { version = "0.1.1", path = "../nanocodex-rlm/crates/nanocodex-rlm" }
+nanocodex-tools = { version = "0.1.1", path = "../nanocodex-rlm/crates/nanocodex-tools", default-features = false }
 nanocodex-vm = { version = "0.1.0", path = "crates/nanocodex-vm" }
 nanoeval = { version = "0.1.0", path = "crates/nanoeval" }
 nanoeval-harbor = { version = "0.1.0", path = "crates/nanoeval-harbor" }
