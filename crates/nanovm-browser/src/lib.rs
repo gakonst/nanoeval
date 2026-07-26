@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanovm::Gvproxy;
+use nanovm::{
+    EgressLease, GuestCommand, Gvproxy, Network, PrivateVmProcessConfig, SharedDirectory, VmConfig,
+    VmProcessConfig,
+};
 use serde::Deserialize;
 use tempfile::TempDir;
 use thiserror::Error;
@@ -30,6 +33,11 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_ERROR_LOG_BYTES: u64 = 64 * 1_024;
 const BROWSER_SCRIPT: &str = concat!(
     "set -eu; ",
+    "while [ \"$#\" -gt 0 ]; do ",
+    "tag=$1; guest=$2; shift 2; ",
+    "mkdir -p -- \"$guest\"; ",
+    "mount -t virtiofs -o ro \"$tag\" \"$guest\"; ",
+    "done; ",
     "rm -f /etc/resolv.conf; ",
     "printf 'nameserver 192.168.127.1\\n' > /etc/resolv.conf; ",
     "mkdir -p /tmp/.X11-unix /home/browser/profile; ",
@@ -66,6 +74,15 @@ pub enum BrowserVmError {
 
     #[error("browser VM firmware directory is not a directory: {0}")]
     InvalidFirmwareDirectory(PathBuf),
+
+    #[error("browser VM egress must request internet access")]
+    InvalidEgressNetwork,
+
+    #[error("browser VM egress host mount is not a directory: {0}")]
+    InvalidEgressMount(PathBuf),
+
+    #[error("browser VM egress guest mount must be absolute: {0}")]
+    InvalidGuestMount(PathBuf),
 
     #[error("failed to create the browser VM's private root disk: {0}")]
     RootDisk(io::Error),
@@ -109,6 +126,9 @@ pub enum BrowserVmError {
 
     #[error(transparent)]
     Network(#[from] nanovm::GvproxyError),
+
+    #[error(transparent)]
+    ProcessConfig(#[from] nanovm::VmProcessError),
 }
 
 /// Builder for one private headed Chromium VM.
@@ -120,6 +140,7 @@ pub struct BrowserVmBuilder {
     cpus: u8,
     memory_mib: u32,
     startup_timeout: Duration,
+    egress: EgressLease,
 }
 
 impl BrowserVmBuilder {
@@ -137,6 +158,7 @@ impl BrowserVmBuilder {
             cpus: DEFAULT_CPUS,
             memory_mib: DEFAULT_MEMORY_MIB,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            egress: EgressLease::internet(),
         }
     }
 
@@ -168,6 +190,16 @@ impl BrowserVmBuilder {
         self
     }
 
+    /// Supplies VM-facing proxy configuration, read-only CA mounts, and
+    /// provider lifecycle guards. The browser owns its dedicated gvproxy
+    /// transport, so the lease must request internet access rather than a
+    /// caller-owned network socket.
+    #[must_use]
+    pub fn egress(mut self, egress: EgressLease) -> Self {
+        self.egress = egress;
+        self
+    }
+
     /// Clones the immutable root disk and starts one private headed Chromium VM.
     ///
     /// # Errors
@@ -195,6 +227,17 @@ impl BrowserVmBuilder {
         {
             return Err(BrowserVmError::InvalidFirmwareDirectory(firmware.clone()));
         }
+        if self.egress.network() != &Network::Internet {
+            return Err(BrowserVmError::InvalidEgressNetwork);
+        }
+        for mount in self.egress.guest_mounts() {
+            if !mount.host_path.is_dir() {
+                return Err(BrowserVmError::InvalidEgressMount(mount.host_path.clone()));
+            }
+            if !mount.guest_path.is_absolute() {
+                return Err(BrowserVmError::InvalidGuestMount(mount.guest_path.clone()));
+            }
+        }
 
         let directory = tempfile::Builder::new()
             .prefix("nanovm-browser-")
@@ -215,22 +258,31 @@ impl BrowserVmBuilder {
         let browser_log_path = directory.path().join("browser-vm.log");
         let browser_log = fs::File::create(&browser_log_path).map_err(BrowserVmError::Spawn)?;
         let browser_error_log = browser_log.try_clone().map_err(BrowserVmError::Spawn)?;
+        let mut vm_config = VmConfig::ext4(&root_disk)
+            .network(Network::gvproxy(network.network_socket()))
+            .cpus(self.cpus)
+            .memory_mib(self.memory_mib);
+        let mut guest_command =
+            GuestCommand::new("/bin/sh").args(["-c", BROWSER_SCRIPT, "nanovm-browser"]);
+        for mount in self.egress.guest_mounts() {
+            vm_config = vm_config
+                .shared_directory(SharedDirectory::read_only(&mount.tag, &mount.host_path));
+            guest_command = guest_command
+                .arg(&mount.tag)
+                .arg(mount.guest_path.as_os_str());
+        }
+        for (name, value) in self.egress.guest_environment() {
+            guest_command = guest_command.env(name, value);
+        }
+        let process_config = VmProcessConfig::new(vm_config, guest_command).write_private()?;
+
         let mut command = tokio::process::Command::new(&self.vmm);
         command
+            .env_clear()
             .arg("vm")
-            .arg("run")
-            .arg("--root")
-            .arg(&root_disk)
-            .arg("--ext4")
-            .arg("--network-socket")
-            .arg(network.network_socket())
-            .arg("--cpus")
-            .arg(self.cpus.to_string())
-            .arg("--memory-mib")
-            .arg(self.memory_mib.to_string())
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(BROWSER_SCRIPT)
+            .arg("run-config")
+            .arg("--config")
+            .arg(process_config.path())
             .stdin(Stdio::null())
             .stdout(Stdio::from(browser_log))
             .stderr(Stdio::from(browser_error_log))
@@ -245,6 +297,8 @@ impl BrowserVmBuilder {
             cdp_endpoint: cdp_http_endpoint,
             root_disk,
             log: browser_log_path,
+            _egress: self.egress,
+            _process_config: process_config,
             _directory: directory,
         };
         browser.cdp_endpoint = browser
@@ -261,6 +315,8 @@ pub struct BrowserVm {
     cdp_endpoint: Url,
     root_disk: PathBuf,
     log: PathBuf,
+    _egress: EgressLease,
+    _process_config: PrivateVmProcessConfig,
     _directory: TempDir,
 }
 

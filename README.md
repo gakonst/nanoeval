@@ -164,11 +164,30 @@ loopback port. The browser is headed inside the guest but no window exists in
 the macOS desktop session. Dropping or explicitly shutting down the handle
 terminates the VMM, gvproxy, and disposable disk.
 
+Host-owned outbound policy is supplied as a `nanovm::EgressLease`. The lease is
+the VM-facing boundary only: an MPP client, secret gateway, or capability
+service may independently produce environment, read-only CA mounts, and
+revocation guards without adding that policy to `nanovm` or the browser
+package. Compatible fragments compose; conflicting network, environment, or
+mount decisions fail closed. Guest values are serialized through a mode-0600
+temporary VMM configuration rather than process arguments, so a bearer proxy
+credential is not exposed in `ps`.
+
 ```rust,ignore
+let mut egress = nanovm::EgressLease::internet();
+egress.insert_environment("HTTPS_PROXY", lease.proxy_url())?;
+egress.insert_mount(nanovm::EgressMount {
+    tag: "egress-ca".into(),
+    host_path: lease.ca_directory().into(),
+    guest_path: "/run/egress/ca".into(),
+})?;
+egress.retain(lease.guard());
+
 let browser_vm = BrowserVmBuilder::new(root_disk, signed_vmm, gvproxy)
     .firmware_directory(libkrun_firmware)
     .cpus(2)
     .memory_mib(2_048)
+    .egress(egress)
     .spawn()
     .await?;
 
