@@ -21,7 +21,8 @@ use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use eyre::{Result, eyre};
 use fs2::FileExt as _;
-use nanocodex::{Thinking, Tools, ToolsBuildError, UpdatePlanTool};
+use nanocodex::{NanocodexBuilder, Thinking, Tools, ToolsBuildError, UpdatePlanTool};
+use nanocodex_rlm::{TaskRuntime, TaskTools};
 use nanocodex_vm::{VmCommand, VmCommandOutput, VmToolSession, VmToolSessionError, VmTools};
 use nanoeval::{
     AttemptAgent, AttemptVerification, AttemptVerifier, EvalAttempt, EvalEventKind, EvalFailure,
@@ -44,6 +45,31 @@ use crate::vm_image::{CachePolicy, PreparedRootDisk, VmImageBuilder};
 use crate::vm_network::{Gvproxy, GvproxyError, prepare_gvproxy};
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = "nanoeval-runs";
+const TURBO_PROMPT_HINT: &str = r#"<nanocodex_turbo enabled="true">
+Recursive structured task tools are available. Before constructing or writing the final candidate,
+start a clean child with only original requirements and source workspace evidence. Require it to
+return a complete executable checker program, not a prose verification plan. The checker must read
+the raw candidate artifact from stdin, inspect authoritative source evidence itself, run required
+external ground-truth commands, and emit a structured verdict. Have the child derive candidate-
+independent invariants from the requirements and evidence. For every parsed boundary or derived
+measurement, enumerate the nearest plausible interpretations instead of silently choosing one.
+Create adversarial fixture pairs that differ only in adjacent, overlapping, aliased, or excluded
+content and make those interpretations disagree. Expected self-test outcomes must come independently
+from the requirements, source evidence, or an external oracle rather than from the production check
+being tested. Every adversarial fixture must pass through the checker's real candidate-input
+entrypoint and assert both its verdict and relevant derived measurements; tests of disconnected
+helper logic do not count. When evidence cannot resolve an interpretation, retain all plausible
+interpretations and accept only candidates satisfying every one. After preflight, start a second
+clean child with the original requirements, source evidence, exact checker bytes, and test transcript.
+Have it black-box the checker with candidate-shaped mutations and return executable counterexamples
+for unsupported assumptions, untested boundaries, or false accepts. Repair through the original
+child and repeat preflight and audit until the critic finds no counterexample. Only then record the
+exact checker bytes, self-test and audit output, and content hash. After candidate construction begins,
+do not modify or reinterpret the checker. Execute those same bytes against the raw candidate and
+write the candidate only when that execution accepts it. Preserve exact checker stdout, stderr, exit
+status, and hash. Treat an undecidable or unaudited checker as a failed preflight rather than replacing
+its checks with parent reasoning.
+</nanocodex_turbo>"#;
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
 const INVOCATION_VERSION: u32 = 1;
@@ -180,6 +206,7 @@ struct ResolvedRun {
     vm_retention: VmRetention,
     thinking: Thinking,
     web_search: bool,
+    turbo: bool,
     rerun_from: Option<PathBuf>,
     automatic_scheduling: Option<AutomaticScheduling>,
 }
@@ -235,6 +262,8 @@ struct RunInvocation {
     thinking: String,
     #[serde(default)]
     web_search: bool,
+    #[serde(default)]
+    turbo: bool,
     rerun_from: Option<PathBuf>,
 }
 
@@ -247,6 +276,7 @@ impl RunInvocation {
             && self.vm_retention == other.vm_retention
             && self.thinking == other.thinking
             && self.web_search == other.web_search
+            && self.turbo == other.turbo
             && self.rerun_from == other.rerun_from
     }
 }
@@ -442,6 +472,10 @@ impl Eval {
                     .map(|invocation| invocation.web_search)
             })
             .unwrap_or(false);
+        let turbo = self.agent.turbo()
+            || retained_invocation
+                .as_ref()
+                .is_some_and(|invocation| invocation.turbo);
         let vm_rootfs = self.vm_rootfs.clone().or_else(|| {
             retained_invocation
                 .as_ref()
@@ -473,6 +507,7 @@ impl Eval {
                 .unwrap_or_default(),
             thinking,
             web_search,
+            turbo,
             rerun_from: rerun.map(|rerun| rerun.job),
             automatic_scheduling: scheduling.automatic,
         })
@@ -499,6 +534,7 @@ impl Eval {
         let observability = observability_started.elapsed();
         let (tasks, task_loading) =
             load_prioritized_tasks(resolved.task_paths.clone(), &resolved.output)?;
+        let tasks = configure_task_prompts(tasks, resolved.turbo);
         let (vmm, runtime_image, vm_runtime) =
             prepare_run_vm(resolved.vm, resolved.vm_rootfs.as_deref()).await?;
         let gvproxy =
@@ -515,11 +551,12 @@ impl Eval {
         .await?;
         let vm_environments_duration = vm_environments_started.elapsed();
         let evaluation_setup_started = Instant::now();
-        let nanocodex = self.agent.builder(resolved.thinking, resolved.web_search)?;
+        let (task_runtime, task_tools, nanocodex, agent_id) =
+            configure_task_arm(self.agent, &resolved)?;
         let sweep = Sweep::builder()
             .tasks(tasks)
             .trials(resolved.trials)
-            .agent("default", nanocodex.clone())?
+            .agent(agent_id, nanocodex.clone())?
             .build()?;
         let attempt_count = sweep.attempt_count();
         let evaluator = Nanoeval::builder(nanocodex)
@@ -528,6 +565,7 @@ impl Eval {
         let evaluator = configure_memory_limit(evaluator, resolved.max_memory_mb);
         let mut evaluator = bind_finite_run(evaluator, &sweep, self.lifecycle.new_job);
         if let Some(environments) = vm_environments {
+            let task_tools = task_tools.clone();
             evaluator = evaluator.attempt_agent(move |attempt, builder| {
                 let environment = environments.get(attempt.task().root()).ok_or_else(|| {
                     VmAttemptError::MissingPreparedEnvironment(attempt.task().root().to_path_buf())
@@ -538,14 +576,12 @@ impl Eval {
                         runtime_image: &runtime_image,
                         vmm: &vmm,
                         gvproxy: gvproxy.as_deref(),
-                        retain_passed_rootfs: resolved.vm_retention.retains_passes(),
+                        retention: resolved.vm_retention,
                         web_search: resolved.web_search,
                     },
                     attempt,
                 )?;
-                Ok::<_, VmAttemptError>(
-                    AttemptAgent::new(builder.tools(runtime.tools)).verifier(runtime.verifier),
-                )
+                Ok::<_, VmAttemptError>(configure_vm_attempt(builder, runtime, task_tools.clone()))
             });
         }
         let (eval, events) = evaluator.build()?;
@@ -564,16 +600,15 @@ impl Eval {
         let attempts_started = Instant::now();
         let sweep_result = eval.sweep(sweep).await;
         let attempts = attempts_started.elapsed();
-        let finished =
-            finish_evaluation(harbor, remaining_attempts, progress, sweep_result).await?;
-        let output_started = Instant::now();
-        Self::write_report(
+        let finished = finish_evaluation(harbor, remaining_attempts, progress, sweep_result).await;
+        shutdown_task_runtime(task_runtime.as_ref()).await;
+        let finished = finished?;
+        let output = Self::finish_output(
             &finished.job,
             finished.outcomes,
             skipped_attempts,
             self.json,
         )?;
-        let output = output_started.elapsed();
         RunMeasurements {
             observability,
             task_loading,
@@ -586,8 +621,19 @@ impl Eval {
             total: total_started.elapsed(),
         }
         .record(&finished.results, attempt_count, finished.failed);
-        record_last_run(finished.job.directory())?;
         finish_run(finished.run_error)
+    }
+
+    fn finish_output(
+        job: &HarborJob,
+        outcomes: Vec<AttemptOutcome>,
+        skipped: usize,
+        json: bool,
+    ) -> Result<Duration> {
+        let started_at = Instant::now();
+        Self::write_report(job, outcomes, skipped, json)?;
+        record_last_run(job.directory())?;
+        Ok(started_at.elapsed())
     }
 
     fn write_report(
@@ -632,12 +678,64 @@ impl Eval {
     }
 }
 
+async fn shutdown_task_runtime(runtime: Option<&TaskRuntime>) {
+    if let Some(runtime) = runtime {
+        runtime.shutdown().await;
+    }
+}
+
+fn configure_task_prompts(tasks: Vec<Task>, turbo: bool) -> Vec<Task> {
+    if turbo {
+        tasks
+            .into_iter()
+            .map(|task| task.with_prompt_suffix(TURBO_PROMPT_HINT))
+            .collect()
+    } else {
+        tasks
+    }
+}
+
+fn configure_task_arm(
+    agent: AgentArgs,
+    resolved: &ResolvedRun,
+) -> Result<(
+    Option<TaskRuntime>,
+    Option<TaskTools>,
+    NanocodexBuilder,
+    String,
+)> {
+    let runtime = resolved.turbo.then(TaskRuntime::new);
+    let tools = runtime.as_ref().map(TaskRuntime::tools);
+    let builder = agent.builder(resolved.thinking, resolved.web_search, tools.clone())?;
+    let id = if resolved.turbo {
+        format!("{}-turbo", resolved.thinking)
+    } else {
+        "default".to_owned()
+    };
+    Ok((runtime, tools, builder, id))
+}
+
+fn configure_vm_attempt(
+    builder: NanocodexBuilder,
+    runtime: VmAttempt,
+    task_tools: Option<TaskTools>,
+) -> AttemptAgent {
+    let VmAttempt { tools, verifier } = runtime;
+    let builder = match task_tools {
+        Some(task_tools) => {
+            builder.tools_factory(move |agent| task_tools.install(tools.clone(), agent))
+        }
+        None => builder.tools(tools),
+    };
+    AttemptAgent::new(builder).verifier(verifier)
+}
+
 impl ResolvedRun {
     fn report_configuration(&self) {
         let environment = if self.vm { "microVM" } else { "host" };
         eprintln!(
-            "Eval config: thinking={} · trials={} · concurrency={} · environment={environment} · web_search={}",
-            self.thinking, self.trials, self.concurrency, self.web_search
+            "Eval config: thinking={} · trials={} · concurrency={} · environment={environment} · web_search={} · turbo={}",
+            self.thinking, self.trials, self.concurrency, self.web_search, self.turbo
         );
     }
 
@@ -680,6 +778,7 @@ impl ResolvedRun {
             vm_retention: self.vm_retention,
             thinking: self.thinking.to_string(),
             web_search: self.web_search,
+            turbo: self.turbo,
             rerun_from: self.rerun_from.clone(),
         }
     }
@@ -1189,6 +1288,8 @@ fn configure_memory_limit(
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum VmRetention {
+    /// Remove disks after every attempt.
+    None,
     /// Retain disks only for failures, refusals, and errors.
     #[default]
     Failures,
@@ -1197,8 +1298,12 @@ enum VmRetention {
 }
 
 impl VmRetention {
-    const fn retains_passes(self) -> bool {
-        matches!(self, Self::All)
+    const fn retains(self, passed: bool) -> bool {
+        match self {
+            Self::None => false,
+            Self::Failures => !passed,
+            Self::All => true,
+        }
     }
 }
 
@@ -1216,7 +1321,7 @@ fn prioritize_tasks(tasks: &mut [Task], output: &Path) -> Result<()> {
         let declared_floor = task
             .agent_timeout()
             .div_f64(4.0)
-            .min(Duration::from_secs(600));
+            .min(Duration::from_mins(10));
         let estimate = estimates
             .get(task.name())
             .copied()
@@ -1637,7 +1742,7 @@ struct VmAttemptHost<'a> {
     runtime_image: &'a Path,
     vmm: &'a Path,
     gvproxy: Option<&'a Path>,
-    retain_passed_rootfs: bool,
+    retention: VmRetention,
     web_search: bool,
 }
 
@@ -1944,7 +2049,7 @@ struct VmVerifier {
     separate_launch: Option<VmLaunch>,
     cache: Option<VerifierCache>,
     attempt_cache: Option<AttemptVerifierCache>,
-    retain_passed_rootfs: bool,
+    retention: VmRetention,
     _network: Option<Gvproxy>,
 }
 
@@ -2075,7 +2180,7 @@ fn vm_attempt_inner(
             separate_launch,
             cache: verifier_cache,
             attempt_cache,
-            retain_passed_rootfs: host.retain_passed_rootfs,
+            retention: host.retention,
             _network: network,
         },
     })
@@ -2705,7 +2810,7 @@ impl VmVerifier {
                     .arg("/")
                     .arg("-xf")
                     .arg("/tmp/nanoeval-artifacts.tar")
-                    .timeout(Duration::from_secs(10 * 60)),
+                    .timeout(Duration::from_mins(10)),
             )
             .await?;
         if output.exit_code != 0 {
@@ -2759,8 +2864,8 @@ impl VmVerifier {
         let reward = String::from_utf8_lossy(&reward_bytes)
             .trim()
             .parse::<f64>()?;
-        if reward > 0.0 && !self.retain_passed_rootfs {
-            self.remove_passed_root_disks();
+        if !self.retention.retains(reward > 0.0) {
+            self.remove_root_disks();
         }
         Ok(AttemptVerification {
             result: VerifierResult {
@@ -2850,23 +2955,23 @@ impl VmVerifier {
         }
     }
 
-    fn remove_passed_root_disks(&self) {
+    fn remove_root_disks(&self) {
         for launch in std::iter::once(&self.launch).chain(self.separate_launch.as_ref()) {
             if !launch.ext4 {
                 continue;
             }
-            match remove_passed_rootfs(&launch.root) {
+            match remove_attempt_rootfs(&launch.root) {
                 Ok(true) => info!(
                     target: "nanoeval",
                     vm_rootfs_path = %launch.root.display(),
-                    "removed passed attempt VM root disk"
+                    "removed attempt VM root disk"
                 ),
                 Ok(false) => {}
                 Err(error) => warn!(
                     target: "nanoeval",
                     vm_rootfs_path = %launch.root.display(),
                     %error,
-                    "failed to remove passed attempt VM root disk"
+                    "failed to remove attempt VM root disk"
                 ),
             }
         }
@@ -3018,6 +3123,9 @@ impl VmVerifier {
 impl Drop for VmVerifier {
     fn drop(&mut self) {
         self.remove_attempt_cache();
+        if self.retention == VmRetention::None {
+            self.remove_root_disks();
+        }
     }
 }
 
@@ -3077,7 +3185,7 @@ async fn mount_verifier_cache(session: &VmToolSession) -> Result<(), VmAttemptEr
     Ok(())
 }
 
-fn remove_passed_rootfs(rootfs: &Path) -> io::Result<bool> {
+fn remove_attempt_rootfs(rootfs: &Path) -> io::Result<bool> {
     if !rootfs.is_file() {
         return Ok(false);
     }
@@ -3411,11 +3519,11 @@ mod tests {
 
     use super::{
         CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, Eval,
-        HostResources, RunInvocation, VM_GUEST_TARGET, VmRetention, cached_verifier_script,
-        load_tasks, load_vm_guest_runtime_record, recognized_verifier_setup, remove_passed_rootfs,
-        retained_retry_task_names, retained_task_durations, stage_vm_guest_runtime,
-        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
-        verifier_shell,
+        HostResources, RunInvocation, TURBO_PROMPT_HINT, VM_GUEST_TARGET, VmRetention,
+        cached_verifier_script, configure_task_prompts, load_tasks, load_vm_guest_runtime_record,
+        recognized_verifier_setup, remove_attempt_rootfs, retained_retry_task_names,
+        retained_task_durations, stage_vm_guest_runtime, verifier_bootstrap_network_failed,
+        verifier_cache_key, verifier_network_retry_delay, verifier_shell,
     };
 
     #[derive(Parser)]
@@ -3451,7 +3559,7 @@ mod tests {
         assert_eq!(cli.eval.max_memory_mb, Some(24_576));
         assert_eq!(cli.eval.host_utilization, DEFAULT_HOST_UTILIZATION_PERCENT);
         assert!(cli.eval.vm);
-        assert!(!cli.eval.vm_retention.unwrap_or_default().retains_passes());
+        assert!(!cli.eval.vm_retention.unwrap_or_default().retains(true));
         assert!(cli.eval.suites.is_empty());
     }
 
@@ -3474,6 +3582,29 @@ mod tests {
         let resolved = cli.eval.resolve_run().unwrap();
 
         assert!(resolved.web_search);
+    }
+
+    #[test]
+    fn turbo_is_an_explicit_retained_eval_arm() {
+        let cli =
+            TestCli::try_parse_from(["nanoeval", "--task", "tasks/first", "--turbo"]).unwrap();
+
+        let resolved = cli.eval.resolve_run().unwrap();
+
+        assert!(resolved.turbo);
+        assert!(resolved.invocation().turbo);
+    }
+
+    #[test]
+    fn turbo_adds_recursive_tool_guidance_to_the_agent_prompt() {
+        let suite = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tasks");
+        let tasks = load_tasks(Vec::new(), vec![suite]).unwrap();
+        let original_prompt = tasks[0].prompt().to_owned();
+
+        let configured = configure_task_prompts(tasks, true);
+
+        assert!(configured[0].prompt().starts_with(&original_prompt));
+        assert!(configured[0].prompt().ends_with(TURBO_PROMPT_HINT));
     }
 
     #[test]
@@ -3534,6 +3665,7 @@ mod tests {
             vm_retention: VmRetention::Failures,
             thinking: "xhigh".to_owned(),
             web_search: false,
+            turbo: false,
             rerun_from: None,
         };
         let mut resumed = retained.clone();
@@ -3544,6 +3676,10 @@ mod tests {
 
         resumed.thinking = "high".to_owned();
         assert!(!retained.same_workload(&resumed));
+
+        let mut turbo = retained.clone();
+        turbo.turbo = true;
+        assert!(!retained.same_workload(&turbo));
     }
 
     #[test]
@@ -3558,7 +3694,22 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(cli.eval.vm_retention.unwrap().retains_passes());
+        assert!(cli.eval.vm_retention.unwrap().retains(true));
+    }
+
+    #[test]
+    fn none_vm_retention_discards_failed_disks() {
+        let cli = TestCli::try_parse_from([
+            "nanoeval",
+            "--task",
+            "tasks/first",
+            "--vm",
+            "--vm-retention",
+            "none",
+        ])
+        .unwrap();
+
+        assert!(!cli.eval.vm_retention.unwrap().retains(false));
     }
 
     #[test]
@@ -3603,9 +3754,9 @@ mod tests {
         let rootfs = directory.path().join("rootfs.ext4");
         fs::write(&rootfs, b"guest disk").unwrap();
 
-        assert!(remove_passed_rootfs(&rootfs).unwrap());
+        assert!(remove_attempt_rootfs(&rootfs).unwrap());
         assert!(!rootfs.exists());
-        assert!(!remove_passed_rootfs(directory.path()).unwrap());
+        assert!(!remove_attempt_rootfs(directory.path()).unwrap());
     }
 
     #[test]
@@ -3791,6 +3942,7 @@ mod tests {
                 vm_retention: super::VmRetention::Failures,
                 thinking: "low".to_owned(),
                 web_search: false,
+                turbo: false,
                 rerun_from: Some(base.canonicalize().unwrap()),
             },
         )
