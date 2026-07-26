@@ -1216,7 +1216,7 @@ fn prioritize_tasks(tasks: &mut [Task], output: &Path) -> Result<()> {
         let declared_floor = task
             .agent_timeout()
             .div_f64(4.0)
-            .min(Duration::from_secs(600));
+            .min(Duration::from_mins(10));
         let estimate = estimates
             .get(task.name())
             .copied()
@@ -2705,7 +2705,7 @@ impl VmVerifier {
                     .arg("/")
                     .arg("-xf")
                     .arg("/tmp/nanoeval-artifacts.tar")
-                    .timeout(Duration::from_secs(10 * 60)),
+                    .timeout(Duration::from_mins(10)),
             )
             .await?;
         if output.exit_code != 0 {

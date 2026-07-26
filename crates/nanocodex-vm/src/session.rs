@@ -50,7 +50,7 @@ impl VmCommand {
             arguments: Vec::new(),
             current_directory: "/".to_owned(),
             environment: Vec::new(),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
         }
     }
 
