@@ -45,6 +45,8 @@ enum Command {
     Serve(Box<Serve>),
     /// Exercise N independent agents through the real HTTP/SSE API.
     Bench(Bench),
+    /// Benchmark the real 1Password SDK provider without VM startup.
+    BenchOnePassword(BenchOnePassword),
     /// Run a command in a VM through a real 1Password-backed secret egress lease.
     SmokeEgress(SmokeEgress),
     /// Download and verify the pinned 1Password SDK core.
@@ -117,6 +119,9 @@ struct Serve {
         requires = "onepassword_service_account_token"
     )]
     onepassword_core_wasm: Option<PathBuf>,
+    /// Parallel 1Password SDK clients. The core is compiled only once.
+    #[arg(long, default_value_t = 3, requires = "onepassword_core_wasm")]
+    onepassword_workers: usize,
     /// API base URL reachable from the guest VM.
     #[arg(long)]
     secret_gateway_url: Option<String>,
@@ -183,6 +188,28 @@ struct Bench {
 }
 
 #[derive(Args)]
+struct BenchOnePassword {
+    /// Server-side reference to resolve. Repeat to benchmark distinct secrets.
+    /// Resolved values are never printed.
+    #[arg(long, required = true)]
+    secret_reference: Vec<String>,
+    #[arg(long, default_value_t = 20)]
+    requests: usize,
+    #[arg(long)]
+    concurrency: Option<usize>,
+    #[arg(long, env = "OP_SERVICE_ACCOUNT_TOKEN", hide_env_values = true)]
+    onepassword_service_account_token: String,
+    #[arg(long, env = "ONEPASSWORD_CORE_WASM")]
+    onepassword_core_wasm: PathBuf,
+    /// Host-owned persistent Wasmtime cache directory.
+    #[arg(long)]
+    cache_directory: Option<PathBuf>,
+    /// Parallel SDK clients. The core is compiled only once.
+    #[arg(long, default_value_t = 1)]
+    workers: usize,
+}
+
+#[derive(Args)]
 struct SmokeEgress {
     /// Prepared `NanoVM` rootfs containing the CLI to run.
     #[arg(long)]
@@ -206,6 +233,9 @@ struct SmokeEgress {
     onepassword_service_account_token: String,
     #[arg(long, env = "ONEPASSWORD_CORE_WASM")]
     onepassword_core_wasm: PathBuf,
+    /// Parallel SDK clients. One is sufficient for this single-secret smoke.
+    #[arg(long, default_value_t = 1)]
+    onepassword_workers: usize,
     /// Guest program followed by its arguments.
     #[arg(required = true, trailing_var_arg = true)]
     command: Vec<String>,
@@ -239,6 +269,7 @@ fn main() -> Result<()> {
             match command {
                 Command::Serve(arguments) => serve(*arguments).await,
                 Command::Bench(arguments) => bench(arguments).await,
+                Command::BenchOnePassword(arguments) => bench_onepassword(arguments).await,
                 Command::SmokeEgress(arguments) => smoke_egress(arguments).await,
                 Command::OnePasswordCore(arguments) => install_onepassword_core(arguments).await,
                 Command::Vmm { .. } | Command::OneShotVmm { .. } => {
@@ -382,10 +413,14 @@ async fn smoke_egress(arguments: SmokeEgress) -> Result<()> {
     )?;
     let manager: Arc<dyn SecretManager> = Arc::new(CompositeSecretManager::new().provider(
         "1password",
-        Arc::new(OnePasswordSdkSecretManager::new(
-            arguments.onepassword_core_wasm,
-            arguments.onepassword_service_account_token,
-        )?),
+        Arc::new(
+            OnePasswordSdkSecretManager::with_cache_directory_and_workers(
+                &arguments.onepassword_core_wasm,
+                arguments.onepassword_service_account_token,
+                onepassword_cache_directory(&arguments.onepassword_core_wasm),
+                arguments.onepassword_workers,
+            )?,
+        ),
     ));
     let gateway = SecretGateway::new(
         Arc::clone(&policy),
@@ -534,7 +569,14 @@ fn secret_gateway(
     ) {
         manager = manager.provider(
             "1password",
-            Arc::new(OnePasswordSdkSecretManager::new(core, token)?),
+            Arc::new(
+                OnePasswordSdkSecretManager::with_cache_directory_and_workers(
+                    core,
+                    token,
+                    arguments.state_directory.join("onepassword-wasmtime-cache"),
+                    arguments.onepassword_workers,
+                )?,
+            ),
         );
     }
     let public_url = arguments
@@ -548,6 +590,13 @@ fn secret_gateway(
         egress,
         &public_url,
     )?))
+}
+
+fn onepassword_cache_directory(core: &std::path::Path) -> PathBuf {
+    core.parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("wasmtime-cache")
 }
 
 fn payment_gate(arguments: &Serve) -> Result<Arc<dyn PaymentGate>> {
@@ -635,6 +684,85 @@ async fn bench(arguments: Bench) -> Result<()> {
     Ok(())
 }
 
+async fn bench_onepassword(arguments: BenchOnePassword) -> Result<()> {
+    if arguments.requests == 0 {
+        bail!("--requests must be greater than zero");
+    }
+    let concurrency = arguments
+        .concurrency
+        .unwrap_or(arguments.requests)
+        .clamp(1, arguments.requests);
+    let cache_directory = arguments
+        .cache_directory
+        .unwrap_or_else(|| onepassword_cache_directory(&arguments.onepassword_core_wasm));
+    let initialization_started = Instant::now();
+    let manager = Arc::new(
+        OnePasswordSdkSecretManager::with_cache_directory_and_workers(
+            arguments.onepassword_core_wasm,
+            arguments.onepassword_service_account_token,
+            cache_directory,
+            arguments.workers,
+        )?,
+    );
+    let initialization = initialization_started.elapsed();
+    let references = arguments
+        .secret_reference
+        .into_iter()
+        .map(|key| SecretRef {
+            provider: "1password".to_owned(),
+            key,
+        })
+        .collect::<Vec<_>>();
+    let warmup_started = Instant::now();
+    for reference in &references {
+        drop(manager.resolve(reference).await?);
+    }
+    let warmup = warmup_started.elapsed();
+
+    let started = Instant::now();
+    let results = stream::iter(0..arguments.requests)
+        .map(|index| {
+            let manager = Arc::clone(&manager);
+            let reference = references[index % references.len()].clone();
+            async move {
+                let started = Instant::now();
+                drop(manager.resolve(&reference).await?);
+                Ok::<Duration, nanocentaur::SecretError>(started.elapsed())
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+    let elapsed = started.elapsed();
+    let mut latencies = results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|duration| duration.as_secs_f64() * 1_000.0)
+        .collect::<Vec<_>>();
+    latencies.sort_by(f64::total_cmp);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&OnePasswordBenchmarkReport {
+            initialization_ms: initialization.as_secs_f64() * 1_000.0,
+            warmup_ms: warmup.as_secs_f64() * 1_000.0,
+            workers: arguments.workers,
+            distinct_references: references.len(),
+            logical_resolutions: arguments.requests,
+            concurrency,
+            wall_ms: elapsed.as_secs_f64() * 1_000.0,
+            logical_resolutions_per_second: count_as_f64(arguments.requests)
+                / elapsed.as_secs_f64(),
+            latency_ms: LatencyReport {
+                p50: percentile(&latencies, 50, 100),
+                p95: percentile(&latencies, 95, 100),
+                max: latencies.last().copied().unwrap_or_default(),
+            },
+        })?
+    );
+    Ok(())
+}
+
 async fn benchmark_agent(
     client: Client,
     base_url: String,
@@ -698,6 +826,19 @@ struct BenchmarkReport {
     concurrency: usize,
     wall_ms: f64,
     throughput_agents_per_second: f64,
+    latency_ms: LatencyReport,
+}
+
+#[derive(Serialize)]
+struct OnePasswordBenchmarkReport {
+    initialization_ms: f64,
+    warmup_ms: f64,
+    workers: usize,
+    distinct_references: usize,
+    logical_resolutions: usize,
+    concurrency: usize,
+    wall_ms: f64,
+    logical_resolutions_per_second: f64,
     latency_ms: LatencyReport,
 }
 

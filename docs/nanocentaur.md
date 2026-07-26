@@ -312,15 +312,22 @@ The SDK core is pinned to the version and SHA-256 digest compiled into
 NanoCentaur. Its WASM runtime has a 60-second call deadline, a 256 MiB memory
 ceiling, no filesystem mounts, and network access only to 1Password's
 `.com`, `.ca`, and `.eu` domains. References are validated before invocation
-and returned values are size-bounded. One reusable client owns the mutable WASM
-runtime on a dedicated host thread behind a bounded typed channel. Overload
-fails closed instead of accumulating unbounded waiters, each resolution has a
-65-second end-to-end deadline, and the worker skips queued work whose caller
-already timed out. Shutdown closes the queue and joins the worker before the
-Extism runtime is released. The service-account token is never placed in a
-process argument, VMM configuration, guest environment, or model context. Like
-Connect, values are resolved per authorized outbound request and are not cached
-by NanoCentaur.
+and returned values are size-bounded. Each reusable client owns its mutable
+WASM runtime on a dedicated host thread; the server defaults to three clients
+created from one compiled module. A coordinator dispatches through a bounded
+typed channel without a shared runtime mutex. Distinct references can resolve
+in parallel, while identical outstanding references are globally
+single-flighted and receive the same in-flight result. The result is discarded
+after those callers are answered: there is no TTL or post-request secret cache,
+so a rotation applies to the next resolution.
+
+Overload fails closed instead of accumulating unbounded waiters, each
+resolution has a 65-second end-to-end deadline, and queued work with no live
+caller is skipped. Startup waits for the first authenticated client and brings
+the remaining pool online in the background. Shutdown closes the queue and
+joins every worker before the Extism runtimes are released. The service-account
+token is never placed in a process argument, VMM configuration, guest
+environment, or model context.
 
 Grant the reference directly or through a reusable role:
 
@@ -395,6 +402,22 @@ cargo run -p nanocentaur-server -- bench \
   --agents 32
 ```
 
+The HTTP benchmark opens one event stream per in-flight agent. Raise the
+service and load-generator file-descriptor limits before testing hundreds of
+concurrent agents; otherwise the operating-system socket ceiling is the result,
+not NanoCentaur capacity. On macOS:
+
+```bash
+ulimit -n 4096
+```
+
+With a local debug build and the zero-delay mock backend, 1,000 agents at
+100-way concurrency completed at 1,341 agents/second (p50 73 ms, p95 93 ms).
+At 500-way concurrency with the raised descriptor limit, 5,000 agents completed
+at 1,003 agents/second (p50 489 ms, p95 582 ms). This benchmark exercises the
+real HTTP, authentication, SQLite durability, actor, and SSE paths, but not VM
+boot or a model provider.
+
 With 1Password Connect:
 
 ```bash
@@ -413,10 +436,10 @@ cargo run -p nanocentaur-server -- onepassword-core
 
 OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
 ONEPASSWORD_CORE_WASM=.cache/onepassword/core-v0.4.0.wasm \
-EXTISM_CACHE_CONFIG=.cache/onepassword/wasmtime-cache.toml \
 cargo run -p nanocentaur-server -- serve \
   --api-key "$NANOCENTAUR_API_KEY" \
-  --admin-token "$NANOCENTAUR_ADMIN_TOKEN"
+  --admin-token "$NANOCENTAUR_ADMIN_TOKEN" \
+  --onepassword-workers 3
 ```
 
 `onepassword-core` downloads from the official tagged 1Password SDK repository
@@ -425,20 +448,36 @@ digest, and atomically creates the destination. An existing untrusted file is
 never overwritten.
 
 The SDK core is large enough that cold Wasmtime compilation is noticeable.
-Use a host-owned cache directory and point Extism at a Wasmtime cache
-configuration:
+NanoCentaur automatically keeps native compilation artifacts in
+`$STATE_DIRECTORY/onepassword-wasmtime-cache`; `smoke-egress` and
+`bench-one-password` default to a `wasmtime-cache` directory beside the pinned
+core. The directory is canonicalized and rejected when it is group- or
+world-writable. It must not be writable by the guest or another tenant.
+Authentication still runs on every process start; the cache only removes
+repeated compilation.
 
-```toml
-# .cache/onepassword/wasmtime-cache.toml
-[cache]
-directory = "/absolute/path/to/.cache/onepassword/wasmtime-cache"
+Use the provider-only benchmark to separate SDK behavior from HTTP, policy,
+proxy, and VM costs. Repeat `--secret-reference` to model unrelated credentials:
+
+```bash
+nanocentaur bench-one-password \
+  --onepassword-core-wasm .cache/onepassword/core-v0.4.0.wasm \
+  --secret-reference "op://$OP_VAULT/COINGECKO_API_KEY/credential" \
+  --secret-reference "op://$OP_VAULT/OPENAI_API_KEY/credential" \
+  --secret-reference "op://$OP_VAULT/GITHUB_TOKEN/credential" \
+  --workers 3 \
+  --requests 12 \
+  --concurrency 12
 ```
 
-The configuration and cache must not be writable by the guest or another
-tenant because they contain native compiled artifacts. In a local debug
-benchmark, a warmed cache reduced service-account-enabled listener readiness
-from 34.35 seconds to 8.34 seconds. Authentication still runs on every server
-start; the cache only removes repeated compilation.
+On the development machine with a warm debug-build cache, provider readiness
+was 3.09 seconds. Twelve concurrent logical resolutions spread across three
+references fell from 11.14 seconds in the serialized implementation to
+1.92 seconds with global coalescing and three workers (5.8x faster). Fifty
+concurrent callers for one reference completed through one physical lookup in
+1.39 seconds (36.1 logical resolutions/second). These are local provider
+measurements, not production capacity claims; network latency and 1Password
+service behavior remain external variables.
 
 ### VM CLI egress smoke test
 
