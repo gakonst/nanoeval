@@ -1,0 +1,45 @@
+[package]
+name = "nanocentaur-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "REST server for host-managed Nanocodex agents"
+
+[features]
+default = []
+mpp = ["dep:mpp"]
+
+[[bin]]
+name = "nanocentaur"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+eyre.workspace = true
+futures-util.workspace = true
+mpp = { version = "0.8.4", default-features = false, features = ["server", "tempo"], optional = true }
+nanocentaur = { package = "nanocentaur", path = "../../crates/nanocentaur" }
+nanocodex.workspace = true
+nanocodex-vm.workspace = true
+nanovm.workspace = true
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanoeval", "crates/nanocodex-vm", "crates/nanoeval", "crates/nanoeval-harbor", "crates/nanovm", "examples"]
+members = ["bin/nanocentaur", "bin/nanoeval", "crates/nanocentaur", "crates/nanocodex-vm", "crates/nanoeval", "crates/nanoeval-harbor", "crates/nanovm", "examples"]
 default-members = ["bin/nanoeval"]
 resolver = "2"
 
@@ -18,19 +18,26 @@ publish = true
 
 [workspace.dependencies]
 arcbox-ext4 = "0.1.2"
+async-trait = "0.1.89"
+axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
 eyre = "0.6"
+extism = "1.30.0"
 futures-util = "0.3.31"
 fs2 = "0.4"
+getrandom = "0.3"
 flate2 = "1.1"
 ignore = "0.4.31"
+hudsucker = { version = "0.23", default-features = false, features = ["http2", "rcgen-ca", "rustls-client"] }
 krun = { package = "libkrun", git = "https://github.com/containers/libkrun", branch = "main", features = ["blk", "net"] }
-nanocodex = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "72ab47a45a843737aa2b0a80fd555b8d0864e5d2" }
-nanocodex-observability = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "72ab47a45a843737aa2b0a80fd555b8d0864e5d2" }
-nanocodex-tools = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "72ab47a45a843737aa2b0a80fd555b8d0864e5d2", default-features = false }
+nanocodex = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "b0d299812c50c40c3942a7b3a46377b43ab7ffb5" }
+nanocodex-observability = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "b0d299812c50c40c3942a7b3a46377b43ab7ffb5" }
+nanocodex-tools = { version = "0.1.0", git = "https://github.com/gakonst/nanocodex", rev = "b0d299812c50c40c3942a7b3a46377b43ab7ffb5", default-features = false }
 nanocodex-vm = { version = "0.1.0", path = "crates/nanocodex-vm" }
+nanocentaur = { version = "0.1.0", path = "crates/nanocentaur" }
 nanoeval = { version = "0.1.0", path = "crates/nanoeval" }
 nanoeval-harbor = { version = "0.1.0", path = "crates/nanoeval-harbor" }
 nanovm = { version = "0.1.0", path = "crates/nanovm" }
@@ -39,6 +46,7 @@ oci-client = { version = "0.17.0", default-features = false, features = ["rustls
 reflink-copy = "0.1.30"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 sha2 = "0.10.9"
@@ -47,7 +55,9 @@ tempfile = "3.20"
 tar = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 url = "2.5"

@@ -1,0 +1,44 @@
+[package]
+name = "nanocentaur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Host-managed Nanocodex sessions with capability-scoped NanoVM tools"
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+extism.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hudsucker.workspace = true
+nanocodex.workspace = true
+nanocodex-vm.workspace = true
+nanovm.workspace = true
+reflink-copy.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[lints]
+workspace = true

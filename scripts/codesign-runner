@@ -15,6 +15,9 @@ if [ "${1:-}" = run ]; then
     done
 elif [ "${1:-}" = vm ] && { [ "${2:-}" = run ] || [ "${2:-}" = prepare ]; }; then
     requires_hypervisor=true
+elif [ "${1:-}" = serve ] || [ "${1:-}" = vmm ]; then
+    # Nanocentaur's signed server path is inherited by its hidden VMM child.
+    requires_hypervisor=true
 else
     for argument in "$@"; do
         if [ "$argument" = --vm ]; then
