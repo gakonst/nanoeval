@@ -23,9 +23,9 @@ pub(crate) fn reflink_or_sparse_copy(source: &Path, destination: &Path) -> io::R
             return Ok(fs::metadata(destination)?.len());
         }
         remove_partial_copy(destination)?;
-        return Err(io::Error::other(format!(
+        Err(io::Error::other(format!(
             "sparse disk copy failed with {status}"
-        )));
+        )))
     }
 
     #[cfg(not(target_os = "linux"))]

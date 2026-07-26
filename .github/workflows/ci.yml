@@ -28,7 +28,7 @@ jobs:
           - os: ubuntu-latest
             rust: stable
           - os: ubuntu-latest
-            rust: "1.88"
+            rust: "1.97"
           - os: macos-latest
             rust: stable
     steps:
